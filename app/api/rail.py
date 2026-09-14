@@ -492,6 +492,27 @@ async def thsr_shape(request: Request):
 #  TRA (Taiwan Railway Administration)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# TDX returns no usable line names for TRA: /v2/Rail/TRA/Line comes back with
+# LineName and LineNo empty on every row, and StationOfLine carries no name at
+# all. These are mapped from each line's observed first/last station, since the
+# ids are not always the mnemonic you would guess -- SA runs 瑞芳→八斗子 (深澳線)
+# and SH runs 中洲→沙崙 (沙崙線), not the other way round.
+TRA_LINE_NAMES = {
+    "WL": "西部幹線",    # 基隆 → 屏東
+    "WL-C": "海線",      # 竹南 → 彰化
+    "EL": "東部幹線",    # 八堵 → 臺東
+    "SL": "南迴線",      # 屏東 → 臺東
+    "PX": "平溪線",      # 三貂嶺 → 菁桐
+    "NW": "內灣線",      # 北新竹 → 內灣
+    "JJ": "集集線",      # 二水 → 車埕
+    "SA": "深澳線",      # 瑞芳 → 八斗子
+    "SH": "沙崙線",      # 中洲 → 沙崙
+    "LJ": "六家線",      # 竹中 → 六家
+    "SU": "蘇澳線",      # 蘇澳新 → 蘇澳
+    "CZ": "成追線",      # 成功 → 追分
+}
+
+
 @router.get("/tra/stations")
 async def tra_stations(request: Request):
     """Get all TRA stations."""
@@ -537,6 +558,43 @@ async def tra_lines(request: Request):
             "line_no": item.get("LineNo", ""),
             "name": (item.get("LineName") or {}).get("Zh_tw", ""),
             "name_en": (item.get("LineName") or {}).get("En", ""),
+        })
+
+    _set_cached(cache_key, lines)
+    return lines
+
+
+@router.get("/tra/station-of-line")
+async def tra_station_of_line(request: Request):
+    """Get the ordered station list of every TRA line."""
+    cache_key = "tra_station_of_line"
+    cached = _get_cached(cache_key, STATIC_CACHE_TTL)
+    if cached is not None:
+        return cached
+
+    tdx = _get_tdx(request)
+    raw = tdx.fetch_paginated_items("/v2/Rail/TRA/StationOfLine")
+
+    lines = []
+    for item in raw:
+        line_id = item.get("LineID", "")
+        stations = []
+        for stop in item.get("Stations") or []:
+            stations.append({
+                "station_id": stop.get("StationID", ""),
+                # Unlike /Station and every Metro resource, TRA's StationOfLine
+                # returns StationName as a bare string, not a {Zh_tw, En} object.
+                "name": stop.get("StationName") or "",
+                "sequence": stop.get("Sequence") or 0,
+            })
+        stations.sort(key=lambda s: s["sequence"])
+        lines.append({
+            "line_id": line_id,
+            # TDX supplies no line names for TRA -- both StationOfLine and
+            # /v2/Rail/TRA/Line come back with LineName/LineNo empty -- so the
+            # Chinese names are mapped here, falling back to the raw id.
+            "line_name": TRA_LINE_NAMES.get(line_id, line_id),
+            "stations": stations,
         })
 
     _set_cached(cache_key, lines)

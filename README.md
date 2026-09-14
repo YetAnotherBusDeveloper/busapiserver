@@ -352,6 +352,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/thsr/shape` | 高鐵路線線型 |
 | GET | `/tra/stations` | 台鐵車站清單 |
 | GET | `/tra/lines` | 台鐵路線清單 |
+| GET | `/tra/station-of-line` | 台鐵各路線的站序清單 |
 | GET | `/tra/timetable/od` | 台鐵起訖站時刻表 |
 | GET | `/tra/liveboard/{station_id}` | 台鐵車站即時到站看板 |
 | GET | `/tra/train-positions/{station_id}` | 台鐵列車位置 |
