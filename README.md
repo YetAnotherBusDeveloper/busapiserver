@@ -89,9 +89,27 @@ pip install -r requirements.txt
 ```env
 TDX_CLIENT_ID=your_client_id
 TDX_CLIENT_SECRET=your_client_secret
+CORS_ORIGINS=https://busapp.avianjay.sbs,http://localhost:8080,http://127.0.0.1:8080
 ```
 
 若需要啟用 OAuth 登入、推播等完整功能，請見下方[環境變數](#環境變數)與[身份驗證與-oauth-設定](#身份驗證與-oauth-設定)。
+
+### Flutter Web 本機開發
+
+Flutter Web 會以瀏覽器的來源呼叫 API。將下列來源保留在 API 部署環境的
+`CORS_ORIGINS`，再以固定埠啟動前端，瀏覽器才能通過 CORS 預檢：
+
+```env
+CORS_ORIGINS=https://busapp.avianjay.sbs,http://localhost:8080,http://127.0.0.1:8080
+```
+
+修改部署環境變數後必須重啟 API 服務。前端以固定埠執行：
+
+```powershell
+flutter run -d chrome --web-port 8080
+```
+
+不要以 `*` 放寬 CORS，也不要加入隨機的 Flutter 開發埠。
 
 ### 初始化並同步資料
 
@@ -232,7 +250,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 | 變數 | 說明 | 預設值 |
 | --- | --- | --- |
-| `CORS_ORIGINS` | 逗號分隔的允許 CORS 來源 | *(空，停用 CORS)* |
+| `CORS_ORIGINS` | 逗號分隔的允許 CORS 來源。Flutter Web 本機開發請包含 `http://localhost:8080` 與 `http://127.0.0.1:8080` | *(空，停用 CORS)* |
 | `CLOUDFLARED_TUNNEL_TOKEN` | 設定後會在啟動時自動建立 Cloudflare Tunnel | *(未設定)* |
 
 ### 身份驗證（OAuth）

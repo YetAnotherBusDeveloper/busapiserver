@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import threading
 import time
 from dataclasses import dataclass, field
@@ -386,8 +387,6 @@ async def get_line_eta(system: str, line_id: str, request: Request):
     For systems with LiveBoard (TRTC, KRTC, TYMC), prefer LiveBoard.
     For systems without LiveBoard data, calculate from StationTimeTable.
     """
-    import datetime
-
     system = system.upper()
     if system not in METRO_SYSTEMS:
         raise HTTPException(404, f"Unknown metro system: {system}")
@@ -473,13 +472,19 @@ async def get_line_eta(system: str, line_id: str, request: Request):
         dest_name = station_tt.get("destination_station_name", "")
         timetables = station_tt.get("timetables", [])
 
-        # Find next arrival
+        # TRTC omits ArrivalTime and publishes the station's departure time.
+        # Use that as the scheduled arrival when no arrival time is available.
         upcoming = [
             t for t in timetables
-            if t.get("arrival_time", "00:00") >= current_time
+            if (t.get("arrival_time") or t.get("departure_time") or "00:00")
+            >= current_time
         ]
         if upcoming:
-            next_arrival = upcoming[0].get("arrival_time", "")
+            next_arrival = (
+                upcoming[0].get("arrival_time")
+                or upcoming[0].get("departure_time")
+                or ""
+            )
             # Calculate seconds until arrival
             try:
                 arr_parts = next_arrival.split(":")
