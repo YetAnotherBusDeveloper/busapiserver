@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -164,6 +166,80 @@ class RealtimeBackfillTests(unittest.TestCase):
             ntpc_opendata_client=self.ntpc_client,
         )
         return realtime_service, route_buses_service
+
+    def test_waiting_batch_requests_recheck_the_city_cache(self) -> None:
+        service, _ = self._build_services()
+        city_lock = threading.Lock()
+        ready = threading.Barrier(3)
+
+        def wait_for_both_callers(city):
+            ready.wait(timeout=5)
+            return city_lock
+
+        with patch.object(service, "_get_city_refresh_lock", side_effect=wait_for_both_callers), \
+             patch.object(self.client, "fetch_estimated_time_of_arrival_batch",
+                          wraps=self.client.fetch_estimated_time_of_arrival_batch) as fetch, \
+             ThreadPoolExecutor(max_workers=2) as executor:
+            with city_lock:
+                first = executor.submit(service.get_batch_snapshots, ["TXG307"])
+                second = executor.submit(service.get_batch_snapshots, ["TXG307"])
+                ready.wait(timeout=5)
+            self.assertIn("TXG307", first.result(timeout=5))
+            self.assertIn("TXG307", second.result(timeout=5))
+        self.assertEqual(fetch.call_count, 1)
+
+    def test_batch_only_refreshes_routes_still_missing_after_lock(self) -> None:
+        self._seed_route("TXG308")
+        service, _ = self._build_services()
+        snapshot = service.get_snapshot("TXG307")
+        service._cache.clear()
+
+        def concurrent_refresh(city):
+            service._set_cached("TXG307", snapshot)
+            return threading.Lock()
+
+        with patch.object(service, "_get_city_refresh_lock", side_effect=concurrent_refresh), \
+             patch.object(self.client, "fetch_estimated_time_of_arrival_batch",
+                          wraps=self.client.fetch_estimated_time_of_arrival_batch) as fetch:
+            result = service.get_batch_snapshots(["TXG307", "TXG308"])
+        self.assertEqual(set(result), {"TXG307", "TXG308"})
+        self.assertEqual(fetch.call_args.args[1], ["TXG308"])
+
+    def test_realtime_supplies_map_cache_for_single_batch_and_fallback(self) -> None:
+        for mode in ("single", "batch", "fallback"):
+            for has_buses in (False, True):
+                with self.subTest(mode=mode, has_buses=has_buses):
+                    service, buses_service = self._build_services()
+                    self.client.buses_payload_by_route["TXG307"] = [{
+                        "SubRouteUID": "TXG307", "PlateNumb": "AAA-1234",
+                        "Direction": 0, "BusPosition": {"PositionLat": 24.1, "PositionLon": 120.65},
+                    }] if has_buses else []
+                    if mode == "single":
+                        service.get_snapshot("TXG307")
+                    elif mode == "batch":
+                        service.get_batch_snapshots(["TXG307"])
+                    else:
+                        service._get_single_route_snapshot(
+                            "TXG307", service._load_static_route("TXG307"), force_refresh=False,
+                        )
+                    with patch.object(self.client, "fetch_realtime_by_frequency_batch") as fetch:
+                        buses = buses_service.get_buses("TXG307")
+                    fetch.assert_not_called()
+                    self.assertEqual(len(buses), int(has_buses))
+
+    def test_eta_304_and_failure_do_not_extend_vehicle_cache(self) -> None:
+        service, buses_service = self._build_services()
+        service.get_snapshot("TXG307")
+        original_expiry = buses_service._cache["TXG307"].expires_at
+        for response in (TDXJSONResponse([], 304, None), RuntimeError("offline")):
+            with self.subTest(response=type(response).__name__):
+                service._cache["TXG307"].expires_at = 0
+                kwargs = {"side_effect": response} if isinstance(response, Exception) else {"return_value": response}
+                with patch.object(self.client, "fetch_estimated_time_of_arrival_batch", **kwargs), \
+                     patch.object(self.client, "fetch_realtime_by_frequency_batch") as fetch:
+                    service.get_snapshot("TXG307")
+                fetch.assert_not_called()
+                self.assertEqual(buses_service._cache["TXG307"].expires_at, original_expiry)
 
     def test_uses_ntpc_eta_fallback_when_new_taipei_tdx_eta_is_empty(self) -> None:
         routeid = "NWT157491"
