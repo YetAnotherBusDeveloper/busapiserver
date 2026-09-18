@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -334,6 +335,12 @@ class MergedRouteRealtimeTests(unittest.TestCase):
         self.assertIn(ABSORBED, batch)
         self.assertIn(CANONICAL, batch)
         self.assertEqual(batch[ABSORBED]["routeid"], CANONICAL)
+
+        # The all-cached fast path must echo aliases too, without another fetch.
+        with patch.object(self.client, "fetch_estimated_time_of_arrival_batch") as fetch:
+            cached = self.service.get_batch_snapshots([ABSORBED])
+        self.assertEqual(cached[ABSORBED], cached[CANONICAL])
+        fetch.assert_not_called()
 
 
 class AliasApiTests(unittest.TestCase):
