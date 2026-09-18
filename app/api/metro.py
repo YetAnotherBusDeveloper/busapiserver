@@ -31,6 +31,7 @@ METRO_SYSTEMS = {
 
 STATIC_CACHE_TTL = 3600  # 1 hour for lines/stations (rarely change)
 LIVEBOARD_CACHE_TTL = 15  # 15 seconds for realtime
+TAIWAN_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
 
 @dataclass
@@ -61,6 +62,108 @@ def _set_cached(key: str, data: object) -> None:
 
 def _get_tdx(request: Request):
     return request.app.state.tdx_client
+
+
+def _taiwan_now() -> datetime.datetime:
+    return datetime.datetime.now(TAIWAN_TZ)
+
+
+def _estimate_minutes_to_seconds(value: object) -> int | None:
+    """Convert TDX Metro LiveBoard's EstimateTime minutes to API seconds."""
+    if value is None:
+        return None
+    try:
+        return max(0, round(float(value) * 60))
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_liveboard(raw: list[dict]) -> list[dict]:
+    entries = []
+    for item in raw:
+        entries.append({
+            "station_id": item.get("StationID", ""),
+            "station_name": (item.get("StationName") or {}).get("Zh_tw", ""),
+            "line_id": item.get("LineID", ""),
+            "destination_id": item.get("DestinationStationID") or item.get("DestinationStaionID", ""),
+            "destination_name": (item.get("DestinationStationName") or {}).get("Zh_tw", ""),
+            "direction": item.get("Direction", 0),
+            "trip_head_sign": item.get("TripHeadSign", ""),
+            "train_no": item.get("TrainNo", ""),
+            "estimated_time": _estimate_minutes_to_seconds(item.get("EstimateTime")),
+            "service_status": item.get("ServiceStatus", 0),
+        })
+    return entries
+
+
+_SERVICE_DAY_KEYS = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+)
+
+
+def _runs_on_date(service_day: dict, service_date: datetime.date) -> bool:
+    if not service_day:
+        return True
+    return bool(service_day.get(_SERVICE_DAY_KEYS[service_date.weekday()], False))
+
+
+def _parse_service_time(
+    value: str,
+    service_date: datetime.date,
+) -> datetime.datetime | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        hours, minutes = (int(part) for part in text.split(":", 1))
+        if hours < 0 or minutes < 0 or minutes >= 60:
+            return None
+        midnight = datetime.datetime.combine(
+            service_date,
+            datetime.time.min,
+            tzinfo=TAIWAN_TZ,
+        )
+        return midnight + datetime.timedelta(hours=hours, minutes=minutes)
+    except (TypeError, ValueError):
+        return None
+
+
+def _next_timetable_arrival(
+    station_timetable: dict,
+    now: datetime.datetime,
+) -> tuple[str, int] | None:
+    candidates = []
+    for service_date in (now.date() - datetime.timedelta(days=1), now.date()):
+        if not _runs_on_date(station_timetable.get("service_day") or {}, service_date):
+            continue
+        timetables = station_timetable.get("timetables") or []
+        timetables = sorted(
+            enumerate(timetables),
+            key=lambda indexed: (indexed[1].get("sequence", indexed[0]), indexed[0]),
+        )
+        previous_arrival = None
+        for _, timetable in timetables:
+            value = timetable.get("arrival_time") or timetable.get("departure_time") or ""
+            arrival = _parse_service_time(value, service_date)
+            if arrival is None:
+                continue
+            # TDX can publish post-midnight trips as 00:xx after 23:xx.
+            while previous_arrival is not None and arrival < previous_arrival:
+                arrival += datetime.timedelta(days=1)
+            previous_arrival = arrival
+            if arrival >= now:
+                candidates.append((arrival, value))
+
+    if not candidates:
+        return None
+    arrival, value = min(candidates, key=lambda candidate: candidate[0])
+    return value, max(0, round((arrival - now).total_seconds()))
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -206,22 +309,10 @@ async def get_liveboard(system: str, line_id: str, request: Request):
         )
     except Exception:
         # Some metro systems (e.g. TMRT) don't support LiveBoard on TDX.
+        LOGGER.warning("TDX Metro LiveBoard unavailable for %s/%s", system, line_id, exc_info=True)
         raw = []
 
-    entries = []
-    for item in raw:
-        entries.append({
-            "station_id": item.get("StationID", ""),
-            "station_name": (item.get("StationName") or {}).get("Zh_tw", ""),
-            "line_id": item.get("LineID", ""),
-            "destination_id": item.get("DestinationStationID") or item.get("DestinationStaionID", ""),
-            "destination_name": (item.get("DestinationStationName") or {}).get("Zh_tw", ""),
-            "direction": item.get("Direction", 0),
-            "trip_head_sign": item.get("TripHeadSign", ""),
-            "train_no": item.get("TrainNo", ""),
-            "estimated_time": item.get("EstimateTime"),  # seconds
-            "service_status": item.get("ServiceStatus", 0),
-        })
+    entries = _normalize_liveboard(raw)
 
     _set_cached(cache_key, entries)
     return entries
@@ -371,8 +462,9 @@ async def get_station_timetable(system: str, request: Request):
             "station_name": (item.get("StationName") or {}).get("Zh_tw", ""),
             "direction": item.get("Direction", 0),
             "line_id": item.get("LineID", ""),
-            "destination_station_id": item.get("DestinationStationID", ""),
+            "destination_station_id": item.get("DestinationStationID") or item.get("DestinationStaionID", ""),
             "destination_station_name": (item.get("DestinationStationName") or {}).get("Zh_tw", ""),
+            "service_day": item.get("ServiceDay") or {},
             "timetables": timetables,
         })
 
@@ -391,7 +483,7 @@ async def get_line_eta(system: str, line_id: str, request: Request):
     if system not in METRO_SYSTEMS:
         raise HTTPException(404, f"Unknown metro system: {system}")
 
-    now = datetime.datetime.now()
+    now = _taiwan_now()
     current_time = now.strftime("%H:%M")
 
     # Try LiveBoard first
@@ -409,20 +501,10 @@ async def get_line_eta(system: str, line_id: str, request: Request):
                 f"/v2/Rail/Metro/LiveBoard/{system}",
                 params={"$filter": f"LineID eq '{line_id}'", "$format": "JSON"},
             )
-            for item in raw:
-                liveboard.append({
-                    "station_id": item.get("StationID", ""),
-                    "station_name": (item.get("StationName") or {}).get("Zh_tw", ""),
-                    "line_id": item.get("LineID", ""),
-                    "destination_id": item.get("DestinationStationID") or item.get("DestinationStaionID", ""),
-                    "destination_name": (item.get("DestinationStationName") or {}).get("Zh_tw", ""),
-                    "direction": item.get("Direction", 0),
-                    "trip_head_sign": item.get("TripHeadSign", ""),
-                    "estimated_time": item.get("EstimateTime"),
-                    "service_status": item.get("ServiceStatus", 0),
-                })
+            liveboard = _normalize_liveboard(raw)
             _set_cached(liveboard_cache_key, liveboard)
         except Exception:
+            LOGGER.warning("TDX Metro LiveBoard unavailable for %s/%s", system, line_id, exc_info=True)
             liveboard = []
 
     # Check if LiveBoard has meaningful data (not all zeros)
@@ -464,49 +546,35 @@ async def get_line_eta(system: str, line_id: str, request: Request):
     # Filter to this line
     line_timetables = [t for t in timetable_data if t.get("line_id") == line_id]
 
-    entries = []
+    entries_by_trip = {}
     for station_tt in line_timetables:
         station_id = station_tt.get("station_id", "")
         station_name = station_tt.get("station_name", "")
         direction = station_tt.get("direction", 0)
+        dest_id = station_tt.get("destination_station_id", "")
         dest_name = station_tt.get("destination_station_name", "")
-        timetables = station_tt.get("timetables", [])
+        next_arrival = _next_timetable_arrival(station_tt, now)
+        if next_arrival is None:
+            continue
+        next_arrival_text, eta_seconds = next_arrival
+        entry = {
+            "station_id": station_id,
+            "station_name": station_name,
+            "line_id": line_id,
+            "direction": direction,
+            "destination_id": dest_id,
+            "destination_name": dest_name,
+            "trip_head_sign": f"往{dest_name}" if dest_name else "",
+            "estimated_time": eta_seconds,
+            "next_arrival": next_arrival_text,
+            "service_status": 0,
+        }
+        key = (station_id, direction, dest_id or dest_name)
+        previous = entries_by_trip.get(key)
+        if previous is None or eta_seconds < previous["estimated_time"]:
+            entries_by_trip[key] = entry
 
-        # TRTC omits ArrivalTime and publishes the station's departure time.
-        # Use that as the scheduled arrival when no arrival time is available.
-        upcoming = [
-            t for t in timetables
-            if (t.get("arrival_time") or t.get("departure_time") or "00:00")
-            >= current_time
-        ]
-        if upcoming:
-            next_arrival = (
-                upcoming[0].get("arrival_time")
-                or upcoming[0].get("departure_time")
-                or ""
-            )
-            # Calculate seconds until arrival
-            try:
-                arr_parts = next_arrival.split(":")
-                arr_minutes = int(arr_parts[0]) * 60 + int(arr_parts[1])
-                now_minutes = now.hour * 60 + now.minute
-                eta_seconds = (arr_minutes - now_minutes) * 60 - now.second
-                if eta_seconds < 0:
-                    eta_seconds = 0
-            except (ValueError, IndexError):
-                eta_seconds = None
-
-            entries.append({
-                "station_id": station_id,
-                "station_name": station_name,
-                "line_id": line_id,
-                "direction": direction,
-                "destination_name": dest_name,
-                "trip_head_sign": f"往{dest_name}" if dest_name else "",
-                "estimated_time": eta_seconds,
-                "next_arrival": next_arrival,
-                "service_status": 0,
-            })
+    entries = list(entries_by_trip.values())
 
     return {
         "source": "timetable",
