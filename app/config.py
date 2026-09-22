@@ -228,7 +228,7 @@ class Settings:
             tdx_retry_attempts=int(os.getenv("TDX_RETRY_ATTEMPTS", "6")),
             tdx_retry_backoff=float(os.getenv("TDX_RETRY_BACKOFF", "2.0")),
             tdx_min_request_interval=float(os.getenv("TDX_MIN_REQUEST_INTERVAL", "0.5")),
-            realtime_cache_ttl=int(os.getenv("REALTIME_CACHE_TTL", "5")),
+            realtime_cache_ttl=int(os.getenv("REALTIME_CACHE_TTL", "15")),
             realtime_track_ttl=int(os.getenv("REALTIME_TRACK_TTL", "30")),
             cors_origins=_split_csv(os.getenv("CORS_ORIGINS"), ()),
             auth_public_base_url=os.getenv(

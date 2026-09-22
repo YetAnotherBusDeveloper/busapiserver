@@ -243,7 +243,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `BUS_DB_PATH` | 主資料庫路徑（完整資料） | `./bus.db` |
 | `BUS_DOWNLOAD_DB_PATH` | 下載用路線目錄資料庫路徑 | `./downloads/bus.db` |
 | `BUS_APP_DB_PATH` | 應用程式資料庫路徑（帳號、分析、公告、回饋、同步資料，與靜態資料庫分離） | `bus.db` 同目錄下的 `app.db` |
-| `REALTIME_CACHE_TTL` | 記憶體內即時資料快取秒數 | `5` |
+| `REALTIME_CACHE_TTL` | 記憶體內即時資料快取秒數 | `15` |
 | `REALTIME_TRACK_TTL` | 同城市即時查詢的批次時窗秒數 | `30` |
 
 ### 網路與部署
