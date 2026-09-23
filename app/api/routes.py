@@ -172,58 +172,75 @@ def _search_routes(
 ) -> list[dict]:
     normalized_query = query.strip()
     prefix_clause = ""
-    query_args: list[object] = []
+    query_args: dict[str, object] = {"limit": limit}
     if routeid_like:
-        prefix_clause = "AND routes.routeid LIKE ?"
-        query_args.append(routeid_like)
+        prefix_clause = "AND routes.routeid LIKE :routeid_like"
+        query_args["routeid_like"] = routeid_like
 
     where_clause = ""
     if normalized_query:
         where_clause = """
             AND (
-                routes.name LIKE ?
-                OR routes.routeid LIKE ?
+                routes.name LIKE :wildcard
+                OR routes.name_en LIKE :wildcard
+                OR routes.routeid LIKE :wildcard
                 OR EXISTS (
                     SELECT 1
                     FROM paths p
                     WHERE p.routeid = routes.routeid
-                      AND p.name LIKE ?
+                      AND (p.name LIKE :wildcard OR p.name_en LIKE :wildcard)
                 )
             )
         """
         wildcard = f"%{normalized_query}%"
-        query_args.extend([wildcard, wildcard, wildcard])
+        query_args.update(
+            {
+                "query_lower": normalized_query.lower(),
+                "prefix": f"{normalized_query.lower()}%",
+                "wildcard": wildcard,
+                "query_length": len(normalized_query),
+            }
+        )
 
     order_clause = "ORDER BY routes.routeid ASC"
     if normalized_query:
-        normalized_lower = normalized_query.lower()
-        query_args.extend(
-            [
-                normalized_lower,
-                f"{normalized_lower}%",
-                f"%{normalized_lower}%",
-                normalized_lower,
-                f"%{normalized_lower}%",
-                len(normalized_query),
-            ]
-        )
         order_clause = """
         ORDER BY
             CASE
-                WHEN LOWER(TRIM(COALESCE(routes.name, ''))) = ? THEN 0
-                WHEN LOWER(TRIM(COALESCE(routes.name, ''))) LIKE ? THEN 1
-                WHEN LOWER(TRIM(COALESCE(routes.name, ''))) LIKE ? THEN 2
-                WHEN LOWER(TRIM(COALESCE(routes.routeid, ''))) = ? THEN 3
-                WHEN LOWER(TRIM(COALESCE(routes.routeid, ''))) LIKE ? THEN 4
-                ELSE 5
+                WHEN LOWER(TRIM(COALESCE(routes.name, ''))) = :query_lower
+                  OR LOWER(TRIM(COALESCE(routes.name_en, ''))) = :query_lower THEN 0
+                WHEN LOWER(TRIM(COALESCE(routes.name, ''))) LIKE :prefix
+                  OR LOWER(TRIM(COALESCE(routes.name_en, ''))) LIKE :prefix THEN 1
+                WHEN LOWER(TRIM(COALESCE(routes.name, ''))) LIKE :wildcard
+                  OR LOWER(TRIM(COALESCE(routes.name_en, ''))) LIKE :wildcard THEN 2
+                WHEN LOWER(TRIM(COALESCE(routes.routeid, ''))) = :query_lower THEN 3
+                WHEN LOWER(TRIM(COALESCE(routes.routeid, ''))) LIKE :wildcard THEN 4
+                WHEN EXISTS (
+                    SELECT 1 FROM paths p
+                    WHERE p.routeid = routes.routeid
+                      AND (
+                          LOWER(TRIM(COALESCE(p.name, ''))) = :query_lower
+                          OR LOWER(TRIM(COALESCE(p.name_en, ''))) = :query_lower
+                      )
+                ) THEN 5
+                WHEN EXISTS (
+                    SELECT 1 FROM paths p
+                    WHERE p.routeid = routes.routeid
+                      AND (
+                          LOWER(TRIM(COALESCE(p.name, ''))) LIKE :prefix
+                          OR LOWER(TRIM(COALESCE(p.name_en, ''))) LIKE :prefix
+                      )
+                ) THEN 6
+                ELSE 7
             END ASC,
-            ABS(LENGTH(TRIM(COALESCE(routes.name, ''))) - ?) ASC,
+            MIN(
+                ABS(LENGTH(TRIM(COALESCE(routes.name, ''))) - :query_length),
+                ABS(LENGTH(TRIM(COALESCE(routes.name_en, ''))) - :query_length)
+            ) ASC,
             LENGTH(TRIM(COALESCE(routes.name, ''))) ASC,
             LOWER(TRIM(COALESCE(routes.name, ''))) ASC,
             routes.routeid ASC
         """
-
-    query_args.append(limit)
 
     rows = connection.execute(
         f"""
@@ -273,9 +290,9 @@ def _search_routes(
         {prefix_clause}
         {where_clause}
         {order_clause}
-        LIMIT ?
+        LIMIT :limit
         """,
-        tuple(query_args),
+        query_args,
     ).fetchall()
 
     return [
@@ -313,11 +330,14 @@ def _load_nearby_stops(
             s.pathid AS pathid,
             s.stopid AS stopid,
             s.name AS stop_name,
+            s.name_en AS stop_name_en,
             s.seq AS seq,
             s.lat AS lat,
             s.lon AS lon,
             r.name AS route_name,
+            r.name_en AS route_name_en,
             COALESCE(p.name, '') AS path_name,
+            COALESCE(p.name_en, '') AS path_name_en,
             SUBSTR(s.routeid, 1, 3) AS city_code
         FROM stops s
         JOIN routes r ON r.routeid = s.routeid
@@ -358,12 +378,15 @@ def _load_nearby_stops(
                 "pathid": int(row["pathid"]),
                 "stopid": row["stopid"],
                 "stop_name": row["stop_name"],
+                "stop_name_en": row["stop_name_en"],
                 "seq": int(row["seq"]),
                 "lat": row_lat,
                 "lon": row_lon,
                 "distance": round(distance, 2),
                 "route_name": row["route_name"],
+                "route_name_en": row["route_name_en"],
                 "path_name": row["path_name"],
+                "path_name_en": row["path_name_en"],
                 "city_code": row["city_code"],
             }
         )
@@ -872,6 +895,7 @@ def get_stop_passby(
                 s.pathid AS pathid,
                 s.seq AS seq,
                 s.name AS stop_name,
+                s.name_en AS stop_name_en,
                 r.name AS route_name,
                 r.name_en AS route_name_en,
                 COALESCE(p.name, '') AS path_name,
@@ -903,6 +927,10 @@ def get_stop_passby(
     stop_name = next(
         (row["stop_name"] for row in stop_rows if row["stop_name"]),
         "",
+    )
+    stop_name_en = next(
+        (row["stop_name_en"] for row in stop_rows if row["stop_name_en"]),
+        None,
     )
 
     service = request.app.state.realtime_service
@@ -943,6 +971,7 @@ def get_stop_passby(
     return {
         "stopid": normalized_stopid,
         "stop_name": stop_name,
+        "stop_name_en": stop_name_en,
         "routes": routes_out,
     }
 
@@ -979,6 +1008,7 @@ def get_route_stops(routeid: str, request: Request, response: Response) -> dict:
             {
                 "pathid": pathid,
                 "name": path["name"],
+                "name_en": path["name_en"],
                 "stops": list(path["stops"]),
             }
         )
@@ -986,6 +1016,7 @@ def get_route_stops(routeid: str, request: Request, response: Response) -> dict:
     return {
         "routeid": routeid,
         "name": static_route["name"],
+        "name_en": static_route["name_en"],
         "paths": response_paths,
     }
 

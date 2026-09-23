@@ -53,19 +53,22 @@ class StopPassbyApiTests(unittest.TestCase):
         stops: list[tuple[int, int, str, str]],
         *,
         pathname: str = "Outbound",
+        route_name_en: str | None = None,
+        path_name_en: str | None = None,
+        stop_name_en: str | None = None,
     ) -> None:
         """stops: list of (pathid, seq, stopid, stop_name)."""
         with get_connection(self.db_path) as connection:
             with connection:
                 connection.execute(
                     "INSERT OR IGNORE INTO routes (routeid, name, name_en) VALUES (?, ?, ?)",
-                    (routeid, route_name, route_name),
+                    (routeid, route_name, route_name_en or route_name),
                 )
                 pathids = {pathid for pathid, _, _, _ in stops}
                 for pathid in pathids:
                     connection.execute(
                         "INSERT OR IGNORE INTO paths (routeid, pathid, name, name_en) VALUES (?, ?, ?, ?)",
-                        (routeid, pathid, pathname, pathname),
+                        (routeid, pathid, pathname, path_name_en or pathname),
                     )
                 connection.executemany(
                     """
@@ -73,7 +76,16 @@ class StopPassbyApiTests(unittest.TestCase):
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
-                        (routeid, pathid, seq, stopid, stop_name, stop_name, 25.0, 121.5)
+                        (
+                            routeid,
+                            pathid,
+                            seq,
+                            stopid,
+                            stop_name,
+                            stop_name_en or stop_name,
+                            25.0,
+                            121.5,
+                        )
                         for pathid, seq, stopid, stop_name in stops
                     ],
                 )
@@ -181,6 +193,28 @@ class StopPassbyApiTests(unittest.TestCase):
         self.assertEqual(len(routes), 2)
         etas_by_path = {route["pathid"]: route["eta"] for route in routes}
         self.assertEqual(etas_by_path, {0: 60, 1: 600})
+
+    def test_returns_bilingual_stop_route_and_path_labels(self) -> None:
+        self._seed_route(
+            "TPE0005",
+            "機場快線",
+            [(0, 1, "AIRPORT", "第一航廈")],
+            pathname="往機場",
+            route_name_en="Airport Express",
+            path_name_en="To Airport",
+            stop_name_en="Terminal 1",
+        )
+
+        response = self.client.get("/api/v1/stops/AIRPORT/passby?city=TPE")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["stop_name"], "第一航廈")
+        self.assertEqual(body["stop_name_en"], "Terminal 1")
+        self.assertEqual(body["routes"][0]["route_name"], "機場快線")
+        self.assertEqual(body["routes"][0]["route_name_en"], "Airport Express")
+        self.assertEqual(body["routes"][0]["path_name"], "往機場")
+        self.assertEqual(body["routes"][0]["path_name_en"], "To Airport")
 
     def test_missing_snapshot_yields_empty_eta_fields(self) -> None:
         self._seed_route(
