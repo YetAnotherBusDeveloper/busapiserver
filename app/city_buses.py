@@ -55,6 +55,7 @@ class _CitySnapshot:
 @dataclass
 class _RouteNames:
     names: dict[str, str]
+    names_en: dict[str, str | None]
     fingerprint: tuple[int, int, int] | None = field(default=None)
 
 
@@ -264,7 +265,8 @@ class CityBusesService:
                 routes.setdefault(
                     routeid,
                     {
-                        "name": names.get(routeid) or routeid,
+                        "name": names.names.get(routeid) or routeid,
+                        "name_en": names.names_en.get(routeid),
                         "route_uid": route_uid or None,
                     },
                 )
@@ -286,7 +288,7 @@ class CityBusesService:
     def _family_entry(
         self,
         route_uid: str,
-        names: dict[str, str],
+        names: _RouteNames,
         alias,
     ) -> dict[str, Any]:
         """Describe a RouteUID whose buses cannot be pinned to one variant.
@@ -300,50 +302,58 @@ class CityBusesService:
         candidates = [
             routeid
             for routeid in alias.family_routeids(route_uid)
-            if names.get(routeid) not in (None, routeid)
+            if names.names.get(routeid) not in (None, routeid)
         ]
         stops_routeid = min(
             candidates,
-            key=lambda routeid: (len(names[routeid]), names[routeid]),
+            key=lambda routeid: (len(names.names[routeid]), names.names[routeid]),
             default=None,
         )
-        name = names[stops_routeid] if stops_routeid else route_uid
+        name = names.names[stops_routeid] if stops_routeid else route_uid
+        name_en = names.names_en.get(stops_routeid) if stops_routeid else None
 
         canonical = alias.canonical(route_uid)
-        geometry_routeid = canonical if canonical in names else stops_routeid
+        geometry_routeid = canonical if canonical in names.names else stops_routeid
 
         return {
             "name": name,
+            "name_en": name_en,
             "stops_routeid": stops_routeid,
             "geometry_routeid": geometry_routeid,
             "routeids": candidates,
         }
 
-    def _route_names(self, prefix: str) -> dict[str, str]:
-        """routeid -> name for one authority, refreshed when the DB is swapped."""
+    def _route_names(self, prefix: str) -> _RouteNames:
+        """Bilingual route names for one authority, refreshed when the DB is swapped."""
         db_path = Path(self.settings.db_path)
         fingerprint = _stat_fingerprint(db_path)
         with self._names_lock:
             cached = self._names.get(prefix)
             if cached is not None and cached.fingerprint == fingerprint:
-                return cached.names
+                return cached
 
         try:
             with get_readonly_connection(db_path) as connection:
                 rows = connection.execute(
-                    "SELECT routeid, name FROM routes WHERE routeid LIKE ?",
+                    "SELECT routeid, name, name_en FROM routes WHERE routeid LIKE ?",
                     (f"{prefix}%",),
                 ).fetchall()
             names = {row["routeid"]: row["name"] for row in rows}
+            names_en = {row["routeid"]: row["name_en"] for row in rows}
         except Exception:
             LOGGER.warning(
                 "city buses route name lookup failed prefix=%s", prefix, exc_info=True
             )
-            return {}
+            return _RouteNames(names={}, names_en={})
 
+        route_names = _RouteNames(
+            names=names,
+            names_en=names_en,
+            fingerprint=fingerprint,
+        )
         with self._names_lock:
-            self._names[prefix] = _RouteNames(names=names, fingerprint=fingerprint)
-        return names
+            self._names[prefix] = route_names
+        return route_names
 
     # -- cache plumbing -------------------------------------------------------
 

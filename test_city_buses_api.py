@@ -153,10 +153,10 @@ class CityBusesTestCase(unittest.TestCase):
                 connection.executemany(
                     "INSERT INTO routes (routeid, name, name_en) VALUES (?, ?, ?)",
                     [
-                        ("TPE101320", "234", None),
-                        ("TPE10231", "民權幹線", None),
-                        ("TPE162593", "民權幹線去程半", None),
-                        ("TPE162594", "民權幹線返程半", None),
+                        ("TPE101320", "234", "Route 234"),
+                        ("TPE10231", "民權幹線", "Minquan Main Line"),
+                        ("TPE162593", "民權幹線去程半", "Minquan Outbound Short"),
+                        ("TPE162594", "民權幹線返程半", "Minquan Inbound Short"),
                         # Stub: name == routeid, no stops, geometry only.
                         ("TPE10272", "TPE10272", None),
                         ("TPE102720", "303區", None),
@@ -215,6 +215,7 @@ class IdentityTests(CityBusesTestCase):
         self.assertEqual(bus["route_uid"], "TPE10132")
         self.assertEqual(bus["id"], "KKA-1234")
         self.assertEqual(body["routes"]["TPE101320"]["name"], "234")
+        self.assertEqual(body["routes"]["TPE101320"]["name_en"], "Route 234")
         self.assertEqual(body["families"], {})
 
     def test_ambiguous_route_uid_is_unresolved_but_still_shown(self) -> None:
@@ -227,6 +228,7 @@ class IdentityTests(CityBusesTestCase):
         self.assertEqual(bus["route_uid"], "TPE10231")
         family = body["families"]["TPE10231"]
         self.assertEqual(family["name"], "民權幹線")
+        self.assertEqual(family["name_en"], "Minquan Main Line")
         self.assertEqual(family["stops_routeid"], "TPE10231")
         self.assertEqual(family["geometry_routeid"], "TPE10231")
         self.assertEqual(
@@ -246,6 +248,7 @@ class IdentityTests(CityBusesTestCase):
         self.assertTrue(all(bus["routeid"] is None for bus in body["buses"]))
         # An unknown RouteUID still yields a describable, if bare, family.
         self.assertEqual(body["families"]["TPE99999"]["name"], "TPE99999")
+        self.assertIsNone(body["families"]["TPE99999"]["name_en"])
         self.assertEqual(body["families"]["TPE99999"]["routeids"], [])
         self.assertIsNone(body["families"]["TPE99999"]["stops_routeid"])
 
