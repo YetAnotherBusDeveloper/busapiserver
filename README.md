@@ -25,6 +25,13 @@ Bus API Server 是一個以 FastAPI 打造的交通資訊後端，整合 [TDX �
 - 台鐵（TRA）與高鐵（THSR）車站、時刻表、即時到站看板、列車位置、行車警示
 - YouBike 等公共自行車站點與鄰近站點查詢
 
+### 固定日期轉乘規劃
+
+- `POST /api/v1/journeys`：以明確班表與步行連結，回傳最快抵達／較少轉乘的非劣路徑。
+- 支援轉乘緩衝、上下車限制、跨午夜班次及連續步行；提供無須憑證的獨立展示程式。
+- 正式 API 需設定 `JOURNEY_TIMETABLE_PATH`；內附資料是虛構展示班表。啟動、資料格式及演算法驗證見 [JOURNEYS.md](JOURNEYS.md)。
+- GTFS 匯入工具可將自備目錄或 ZIP 轉成指定日期班表與來源／排除報告；以 `uv run --isolated --python 3.13 --with-requirements requirements.txt --with "fastapi==0.115.14" python -m app.journey_gtfs --help` 查看參數。步行連結需明確設定，支援範圍與虛構範例見 [GTFS 匯入說明](JOURNEYS.md#offline-gtfs-import)。
+
 ### 帳號系統
 
 - 僅支援 Discord / Google OAuth，無帳號密碼登入
@@ -245,6 +252,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `BUS_APP_DB_PATH` | 應用程式資料庫路徑（帳號、分析、公告、回饋、同步資料，與靜態資料庫分離） | `bus.db` 同目錄下的 `app.db` |
 | `REALTIME_CACHE_TTL` | 記憶體內即時資料快取秒數 | `15` |
 | `REALTIME_TRACK_TTL` | 同城市即時查詢的批次時窗秒數 | `30` |
+| `REALTIME_REQUEST_BUDGET_SECONDS` | API 上游等待預算；排隊、權杖取得、節流、重試與各資源共用期限 | `10` |
 
 ### 網路與部署
 
@@ -323,6 +331,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/v1/routes` | 跨城市搜尋路線 |
 | GET | `/api/v1/cities/{city}/routes` | 依城市搜尋路線 |
 | GET | `/api/v1/cities/{city}/stops/nearby` | 查詢城市內鄰近站牌 |
+| GET | `/api/v1/stops/search` | 依中英文站名搜尋行經路線與方向，可一次指定多個城市 |
 | GET | `/api/v1/routes/{routeid}/realtime` | 單一路線即時到站 |
 | GET | `/api/v1/batchroutes/{routeids}/realtime` | 批次查詢多條路線即時到站（同城市共用一次 TDX 請求） |
 | GET | `/api/v1/routes/{routeid}/realtime/buses` | 路線上所有公車目前位置 |
@@ -482,6 +491,23 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 </details>
 
+### 站名搜尋
+
+`GET /api/v1/stops/search` 使用既有靜態資料庫，不呼叫 TDX 即時來源。
+
+```bash
+curl --get https://bus.avianjay.sbs/api/v1/stops/search \
+  --data-urlencode "query=市政府" \
+  --data-urlencode "cities=Taipei,NewTaipei" \
+  --data-urlencode "limit=40"
+```
+
+- `query` 必填，最多 120 字元；支援中英文、大小寫與「台／臺」正規化。`%`、`_` 與引號皆視為文字。
+- `cities` 選填，接受以逗號分隔的正式城市名稱或代碼，如 `Taipei,NWT,InterCity`；省略代表全台。無效或空白城市項目回傳 `422`。
+- `limit` 預設 40，上限 100。每個 `(routeid, pathid)` 回傳最符合的一站，先精確比對，再前綴、部分比對；同方向重複站牌不會占用多個結果名額。
+- 每筆包含 `routeid`、`route_name`／`route_name_en`、`pathid`、`path_name`／`path_name_en`、`stopid`、`stop_name`／`stop_name_en`、`seq`、`lat`、`lon` 與 `city_code`。`stopid` 保留原字串，包括前導零。
+- 合法查詢沒有結果時回傳 `200` 與空陣列；原有全域 rate limit 同樣適用。
+
 ### 公車即時到站回應格式
 
 ```bash
@@ -491,6 +517,8 @@ curl http://127.0.0.1:8000/api/v1/routes/TPE307/realtime
 每個站牌物件包含：
 
 - `eta`：該站最近一班的到站秒數（向下相容欄位）
+- `eta_reference_at`：`eta`／`etas[].eta` 的計算基準時間（Unix 秒）。前端倒數只能扣除此時間之後的經過秒數。
+- `updated_at`：上游觀測更新時間，用於判斷資料新鮮度；不要再拿它扣一次 ETA。單路線、批次、站牌及整站查詢均保留這兩種時間。
 - `message`：站牌狀態文字（向下相容；`eta` 有值時通常為空）
 - `buses`：預估最快抵達本站的車輛車牌（每輛車只會出現一次）
   - `source`：`tdx`（原生逐站到站資料）或 `backfill_buses`（原本在 TDX 到站資料中出現、後來消失的車輛，暫時以 `/realtime/buses` 車輛位置回補）
@@ -523,6 +551,10 @@ curl http://127.0.0.1:8000/api/v1/routes/TPE307/realtime/buses
 ```
 
 所有 API 回傳的時間戳皆為 Unix timestamp（秒）。
+
+即時路線快取的備援壽命上限為 90 秒；更新失敗或 `304` 只會延後下次嘗試，不會重設觀測時間或備援壽命。超過上限後單路線查詢回報上游失敗，批次查詢保留其他成功的路線。成功取得的回應中，來源時間超過 90 秒的站牌也會清除 ETA／車輛資訊並標記 `stale`。車輛位置來源失敗時，仍提供此次成功取得的到站資料。
+
+`REALTIME_REQUEST_BUDGET_SECONDS` 限制各階段的上游等待與重試；同步 HTTP 讀取仍受底層網路 timeout 行為影響，因此不是整個 API 回應的硬性 SLA。背景靜態同步沿用原有長時間重試設定。
 
 ## 身份驗證與 OAuth 設定
 
@@ -767,7 +799,7 @@ App 的「設定」中有一個帳號頁面，可用來：
 
 - Runtime 日誌寫入 `./logs/app.log`，每日輪替，超過 7 天自動清除
 - 日誌內容包含本機時間、等級與 logger 名稱
-- 每個 API 請求會記錄到應用程式資料庫（`app.db`）的 `request_analytics`
+- API 請求分析由背景執行緒批次寫入 `app.db` 的 `request_analytics`，不在事件迴圈內等待 SQLite。佇列上限 2,048 筆、每批最多 64 筆、正常約 250 ms 刷寫；滿載或資料庫故障時採 best-effort 並記錄丟棄數量。關機最多等待 6 秒收尾。
 - App 端會傳送 `YABus/version-commitHash (Platform)` 格式的 User-Agent，會與一般瀏覽器 User-Agent 分開解析
 - `GET /api/v1/admin/analytics` 提供彙總後的請求分析（僅限 admin）
 - `GET /admin/analytics` 提供對應的視覺化儀表板頁面
@@ -777,9 +809,11 @@ App 的「設定」中有一個帳號頁面，可用來：
 專案內含大量以 `TestClient` 撰寫的測試檔（`test_*.py`）。測試相依套件（例如 `pytest`）未列在 `requirements.txt` 中，需另外安裝：
 
 ```bash
-pip install pytest
-pytest
+pip install pytest httpx
+python -m pytest --ignore=test_tdx_metro.py --ignore=test_tdx_tra_station_of_line.py
 ```
+
+`test_tdx_metro.py`、`test_tdx_tra_station_of_line.py` 是需真實憑證的手動探測腳本；上述指令執行其餘離線回歸套件。
 
 ## 隱私權與服務條款
 
