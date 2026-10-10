@@ -19,6 +19,7 @@ from app.logging_utils import get_logger
 from app.rate_limit import enforce_rate_limit
 from app.route_aliases import get_route_alias_index
 from app.sync_realtime import RouteNotFoundError
+from app.stop_search import search_stop_routes
 
 LOGGER = get_logger("routes")
 WEB_ROOT = Path(__file__).resolve().parents[1] / "web"
@@ -483,6 +484,32 @@ def get_route_realtime(routeid: str, request: Request) -> dict:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail="TDX upstream request failed.") from exc
+
+
+@router.get("/api/v1/stops/search")
+def search_routes_by_stop_name(
+    request: Request,
+    query: str = Query(..., min_length=1, max_length=120),
+    cities: str | None = Query(default=None, max_length=400),
+    limit: int = Query(default=40, ge=1, le=100),
+) -> list[dict]:
+    """Find route directions by Chinese/English stop name without downloading a DB.
+
+    Omit cities for all authorities, or provide comma-separated names/codes.
+    Matching is literal (including % and _); no upstream realtime calls are made.
+    """
+    prefixes: set[str] = set()
+    if cities is not None:
+        for city in cities.split(","):
+            resolved = _resolve_city(city)
+            if resolved is None:
+                raise HTTPException(status_code=422, detail="Unknown or empty city in stop search.")
+            prefixes.add(resolved[0])
+    settings = request.app.state.settings
+    with get_connection(settings.db_path) as connection:
+        return search_stop_routes(
+            connection, query=query, city_prefixes=tuple(sorted(prefixes)), limit=limit,
+        )
 
 
 @router.get("/api/v1/cities/{city}/routes")
