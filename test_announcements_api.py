@@ -109,11 +109,10 @@ class AnnouncementsApiTests(unittest.TestCase):
         )
 
     def test_main_app_registers_announcement_routes(self) -> None:
-        paths = {route.path for route in app.routes}
-
-        self.assertIn("/admin/announcements", paths)
-        self.assertIn("/api/v1/announcements", paths)
-        self.assertIn("/api/v1/announcements/{announcement_id}", paths)
+        self.assertEqual(str(app.url_path_for("announcements_page")), "/admin/announcements")
+        self.assertEqual(str(app.url_path_for("list_announcements")), "/api/v1/announcements")
+        self.assertEqual(str(app.url_path_for("update_announcement", announcement_id=1)),
+                         "/api/v1/announcements/1")
 
     def test_create_and_patch_require_moderator_role(self) -> None:
         request = self._request()

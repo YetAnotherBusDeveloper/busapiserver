@@ -84,11 +84,9 @@ class FeedbackApiTests(unittest.TestCase):
         )
 
     def test_main_app_registers_feedback_routes(self) -> None:
-        paths = {route.path for route in app.routes}
-
-        self.assertIn("/api/v1/feedback", paths)
-        self.assertIn("/api/v1/admin/feedbacks", paths)
-        self.assertIn("/admin/feedbacks", paths)
+        self.assertEqual(str(app.url_path_for("create_feedback")), "/api/v1/feedback")
+        self.assertEqual(str(app.url_path_for("list_feedbacks")), "/api/v1/admin/feedbacks")
+        self.assertEqual(str(app.url_path_for("feedbacks_page")), "/admin/feedbacks")
 
     def test_feedback_create_requires_login(self) -> None:
         self._set_principal(None)

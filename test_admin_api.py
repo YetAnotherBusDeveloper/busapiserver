@@ -90,14 +90,16 @@ class AdminApiTests(unittest.TestCase):
         analytics_api.get_request_principal = lambda request: principal
 
     def test_main_app_registers_admin_routes(self) -> None:
-        paths = {route.path for route in app.routes}
-
-        self.assertIn("/admin/analytics", paths)
-        self.assertIn("/admin/announcements", paths)
-        self.assertIn("/admin/user_manage", paths)
-        self.assertIn("/api/v1/admin/analytics", paths)
-        self.assertIn("/api/v1/admin/users", paths)
-        self.assertIn("/api/v1/admin/static-sync", paths)
+        # Public reverse routing works with both flat and nested router storage.
+        for name, path in (
+            ("analytics_dashboard", "/admin/analytics"),
+            ("announcements_page", "/admin/announcements"),
+            ("user_manage_page", "/admin/user_manage"),
+            ("get_analytics", "/api/v1/admin/analytics"),
+            ("list_users", "/api/v1/admin/users"),
+            ("trigger_static_sync", "/api/v1/admin/static-sync"),
+        ):
+            self.assertEqual(str(app.url_path_for(name)), path)
 
     def test_admin_pages_require_login_or_admin_role(self) -> None:
         request = self._request()

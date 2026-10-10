@@ -68,10 +68,8 @@ class PushApiTests(unittest.TestCase):
         return _FakeRequest(self.settings, user_agent=user_agent)
 
     def test_main_app_registers_push_routes(self) -> None:
-        paths = {route.path for route in app.routes}
-
-        self.assertIn("/api/v1/push/public-config", paths)
-        self.assertIn("/api/v1/push/fcm-token", paths)
+        self.assertEqual(str(app.url_path_for("public_push_config")), "/api/v1/push/public-config")
+        self.assertEqual(str(app.url_path_for("register_push_token")), "/api/v1/push/fcm-token")
 
     def test_register_push_token_upserts_existing_token(self) -> None:
         request = self._request()

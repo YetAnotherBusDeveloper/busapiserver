@@ -132,10 +132,9 @@ class AccountSyncApiTests(unittest.TestCase):
         return response, result
 
     def test_main_app_registers_account_sync_routes(self) -> None:
-        paths = {route.path for route in app.routes}
-
-        self.assertIn("/api/v1/account/sync", paths)
-        self.assertIn("/api/v1/account/sync/{namespace}", paths)
+        self.assertEqual(str(app.url_path_for("account_sync_status")), "/api/v1/account/sync")
+        self.assertEqual(str(app.url_path_for("account_sync_document", namespace="favorites")),
+                         "/api/v1/account/sync/favorites")
 
     def test_sync_endpoints_require_login(self) -> None:
         self._set_principal(None)
