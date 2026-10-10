@@ -1,0 +1,3 @@
+service_id,date,exception_type
+HOLIDAY,20261010,2
+SPECIAL,20261010,1

@@ -1,0 +1,5 @@
+route_id,agency_id,route_short_name,route_long_name,route_type
+LOCAL,SYN,DEMO-10,Fictional Local,3
+EXPRESS,SYN,DEMO-20,Fictional Express,702
+NIGHT,SYN,DEMO-N,Fictional Night Bus,3
+RAIL,SYN,DEMO-RAIL,Fictional Excluded Train,2

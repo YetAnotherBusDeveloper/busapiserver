@@ -1,0 +1,6 @@
+stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station
+A,Fictional Forecourt,25.00,121.50,0,
+B,Fictional Market East,25.01,121.51,0,
+C,Fictional Market West,25.01,121.52,0,
+D,Fictional Hospital,25.02,121.53,0,
+X,Fictional Isolated Stop,25.03,121.54,0,

@@ -1,0 +1,11 @@
+route_id,service_id,trip_id
+LOCAL,WEEK,local-0800
+EXPRESS,WEEK,express-0814
+NIGHT,WEEK,night-2350
+LOCAL,HOLIDAY,removed-holiday
+LOCAL,SPECIAL,added-special
+RAIL,WEEK,excluded-train
+LOCAL,WEEK,frequency-template
+LOCAL,WEEK,approximate-template
+LOCAL,WEEK,phone-template
+LOCAL,WEEK,incomplete-template
