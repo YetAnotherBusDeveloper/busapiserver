@@ -25,6 +25,7 @@ from app.api.routes import router
 from app.api.metro import router as metro_router
 from app.api.rail import router as rail_router
 from app.api.bike import router as bike_router
+from app.api.journeys import router as journeys_router
 from app.api.city_buses import router as city_buses_router
 from app.city_buses import CityBusesService
 from app.config import get_settings
@@ -369,3 +370,4 @@ app.include_router(city_buses_router)
 app.include_router(metro_router)
 app.include_router(rail_router)
 app.include_router(bike_router)
+app.include_router(journeys_router)

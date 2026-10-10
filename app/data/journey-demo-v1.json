@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "dataset_id": "synthetic-taipei-neighborhood-v1",
+  "source": "Hand-authored fictional bus services; not live or official coverage",
+  "is_demo": true,
+  "service_date": "2026-10-10",
+  "timezone": "Asia/Taipei",
+  "stops": [
+    {"id": "A", "name": "Demo railway forecourt"},
+    {"id": "B", "name": "Demo market east", "min_transfer_seconds": 60},
+    {"id": "C", "name": "Demo market west", "min_transfer_seconds": 60},
+    {"id": "D", "name": "Demo hospital"},
+    {"id": "X", "name": "Demo isolated stop"}
+  ],
+  "footpaths": [
+    {"from_stop": "B", "to_stop": "C", "seconds": 180},
+    {"from_stop": "C", "to_stop": "B", "seconds": 180}
+  ],
+  "trips": [
+    {"id": "local-0800", "route_id": "DEMO-10", "stop_times": [
+      {"stop_id": "A", "arrival": 28800, "departure": 28800},
+      {"stop_id": "B", "arrival": 29400, "departure": 29460},
+      {"stop_id": "D", "arrival": 31500, "departure": 31500}
+    ]},
+    {"id": "express-0814", "route_id": "DEMO-20", "stop_times": [
+      {"stop_id": "C", "arrival": 29640, "departure": 29640},
+      {"stop_id": "D", "arrival": 30300, "departure": 30300}
+    ]},
+    {"id": "night-2350", "route_id": "DEMO-N", "stop_times": [
+      {"stop_id": "A", "arrival": 85800, "departure": 85800},
+      {"stop_id": "D", "arrival": 87600, "departure": 87600}
+    ]}
+  ]
+}
