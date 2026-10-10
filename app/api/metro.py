@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from app.config import CITY_PREFIX_TO_NAME
 from app.logging_utils import get_logger
 from app.rate_limit import enforce_rate_limit
+from app.singleflight import singleflight
 
 LOGGER = get_logger("metro")
 
@@ -178,7 +179,8 @@ async def list_systems():
 
 
 @router.get("/{system}/lines")
-async def get_lines(system: str, request: Request):
+@singleflight
+def get_lines(system: str, request: Request):
     """Get all lines for a metro system."""
     system = system.upper()
     if system not in METRO_SYSTEMS:
@@ -220,7 +222,8 @@ async def get_lines(system: str, request: Request):
 
 
 @router.get("/{system}/stations")
-async def get_stations(system: str, request: Request):
+@singleflight
+def get_stations(system: str, request: Request):
     """Get all stations for a metro system."""
     system = system.upper()
     if system not in METRO_SYSTEMS:
@@ -252,7 +255,8 @@ async def get_stations(system: str, request: Request):
 
 
 @router.get("/{system}/station-of-line")
-async def get_station_of_line(system: str, request: Request):
+@singleflight
+def get_station_of_line(system: str, request: Request):
     """Get station sequences per line for a metro system."""
     system = system.upper()
     if system not in METRO_SYSTEMS:
@@ -290,7 +294,8 @@ async def get_station_of_line(system: str, request: Request):
 
 
 @router.get("/{system}/lines/{line_id}/liveboard")
-async def get_liveboard(system: str, line_id: str, request: Request):
+@singleflight
+def get_liveboard(system: str, line_id: str, request: Request):
     """Get real-time arrival/departure info for a metro line."""
     system = system.upper()
     if system not in METRO_SYSTEMS:
@@ -319,7 +324,8 @@ async def get_liveboard(system: str, line_id: str, request: Request):
 
 
 @router.get("/{system}/lines/{line_id}/shape")
-async def get_shape(system: str, line_id: str, request: Request):
+@singleflight
+def get_shape(system: str, line_id: str, request: Request):
     """Get route geometry for a metro line."""
     system = system.upper()
     if system not in METRO_SYSTEMS:
@@ -350,7 +356,8 @@ async def get_shape(system: str, line_id: str, request: Request):
 
 
 @router.get("/{system}/frequency")
-async def get_frequency(system: str, request: Request):
+@singleflight
+def get_frequency(system: str, request: Request):
     """Get service frequency info for a metro system."""
     system = system.upper()
     if system not in METRO_SYSTEMS:
@@ -388,7 +395,8 @@ async def get_frequency(system: str, request: Request):
 
 
 @router.get("/{system}/s2s-traveltime")
-async def get_s2s_traveltime(system: str, request: Request):
+@singleflight
+def get_s2s_traveltime(system: str, request: Request):
     """Get station-to-station travel time."""
     system = system.upper()
     if system not in METRO_SYSTEMS:
@@ -430,7 +438,8 @@ TIMETABLE_SUPPORTED_SYSTEMS = {"TRTC", "KRTC", "TYMC", "KLRT"}
 
 
 @router.get("/{system}/station-timetable")
-async def get_station_timetable(system: str, request: Request):
+@singleflight
+def get_station_timetable(system: str, request: Request):
     """Get station timetable for calculating ETA from schedule."""
     system = system.upper()
     if system not in METRO_SYSTEMS:
@@ -473,7 +482,8 @@ async def get_station_timetable(system: str, request: Request):
 
 
 @router.get("/{system}/lines/{line_id}/eta")
-async def get_line_eta(system: str, line_id: str, request: Request):
+@singleflight
+def get_line_eta(system: str, line_id: str, request: Request):
     """Get calculated ETA for each station based on timetable.
 
     For systems with LiveBoard (TRTC, KRTC, TYMC), prefer LiveBoard.
@@ -497,12 +507,7 @@ async def get_line_eta(system: str, line_id: str, request: Request):
         liveboard = liveboard_cached
     elif system in TIMETABLE_SUPPORTED_SYSTEMS:
         try:
-            raw = tdx.fetch_paginated_items(
-                f"/v2/Rail/Metro/LiveBoard/{system}",
-                params={"$filter": f"LineID eq '{line_id}'", "$format": "JSON"},
-            )
-            liveboard = _normalize_liveboard(raw)
-            _set_cached(liveboard_cache_key, liveboard)
+            liveboard = get_liveboard(system, line_id, request)
         except Exception:
             LOGGER.warning("TDX Metro LiveBoard unavailable for %s/%s", system, line_id, exc_info=True)
             liveboard = []
@@ -523,7 +528,7 @@ async def get_line_eta(system: str, line_id: str, request: Request):
     # Fall back to timetable calculation
     if system not in TIMETABLE_SUPPORTED_SYSTEMS:
         # For TMRT, return frequency info instead
-        freq_data = await get_frequency(system, request)
+        freq_data = get_frequency(system, request)
         line_freq = [f for f in freq_data if f.get("line_id") == line_id]
         return {
             "source": "frequency",
@@ -534,7 +539,7 @@ async def get_line_eta(system: str, line_id: str, request: Request):
         }
 
     # Calculate ETA from timetable
-    timetable_response = await get_station_timetable(system, request)
+    timetable_response = get_station_timetable(system, request)
     if not timetable_response.get("supported"):
         return {
             "source": "none",

@@ -2,10 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty, Full, Queue
 import re
+import threading
 import time
+from typing import Any
 
 from app.db import get_connection
+from app.logging_utils import get_logger
+
+LOGGER = get_logger("request_analytics")
 
 
 MAX_USER_AGENT_LENGTH = 500
@@ -107,10 +113,31 @@ def record_request_analytics(
     user_agent: str | None,
     requested_at: int | None = None,
 ) -> None:
+    record_request_analytics_batch(db_path, [dict(
+        method=method, endpoint=endpoint, path=path, status_code=status_code,
+        user_agent=user_agent, requested_at=requested_at,
+    )])
+
+
+def _analytics_row(
+    *, method: str, endpoint: str, path: str, status_code: int,
+    user_agent: str | None, requested_at: int | None = None,
+) -> tuple[object, ...]:
     parsed = parse_user_agent(user_agent)
     safe_user_agent = (user_agent or "").strip()[:MAX_USER_AGENT_LENGTH]
+    return (
+        int(time.time() if requested_at is None else requested_at),
+        method, endpoint, path, int(status_code), parsed.client_family,
+        parsed.platform_name, parsed.system_name, parsed.system_version,
+        parsed.app_version, parsed.app_commit_hash, parsed.browser_name,
+        parsed.browser_version, safe_user_agent,
+    )
+
+
+def record_request_analytics_batch(db_path: str | Path, events: list[dict[str, Any]]) -> None:
+    rows = [_analytics_row(**event) for event in events]
     with get_connection(db_path) as connection:
-        connection.execute(
+        connection.executemany(
             """
             INSERT INTO request_analytics (
                 requested_at,
@@ -130,24 +157,95 @@ def record_request_analytics(
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                int(requested_at or time.time()),
-                method,
-                endpoint,
-                path,
-                int(status_code),
-                parsed.client_family,
-                parsed.platform_name,
-                parsed.system_name,
-                parsed.system_version,
-                parsed.app_version,
-                parsed.app_commit_hash,
-                parsed.browser_name,
-                parsed.browser_version,
-                safe_user_agent,
-            ),
+            rows,
         )
         connection.commit()
+
+
+class AnalyticsWriter:
+    """Bounded, best-effort telemetry; no SQLite work on a request's event loop."""
+
+    def __init__(
+        self, db_path: str | Path, *, capacity: int = 2048, batch_size: int = 64,
+        flush_interval: float = 0.25,
+    ) -> None:
+        if capacity <= 0 or batch_size <= 0 or flush_interval <= 0:
+            raise ValueError("Analytics queue and flush limits must be positive")
+        self.db_path = db_path
+        self._queue: Queue[dict[str, Any]] = Queue(maxsize=capacity)
+        self._batch_size = batch_size
+        self._flush_interval = flush_interval
+        self._stop = threading.Event()
+        self._shutdown_deadline = float("inf")
+        self.dropped = 0
+        self.written = 0
+        self._thread = threading.Thread(target=self._run, name="request-analytics", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def submit(
+        self, *, method: str, endpoint: str, path: str, status_code: int,
+        user_agent: str | None,
+    ) -> bool:
+        if self._stop.is_set():
+            return False
+        event = dict(
+            method=method, endpoint=endpoint, path=path[:2048], status_code=status_code,
+            user_agent=(user_agent or "")[:MAX_USER_AGENT_LENGTH], requested_at=int(time.time()),
+        )
+        try:
+            self._queue.put_nowait(event)
+            return True
+        except Full:
+            self.dropped += 1
+            # Log sparsely even during an extended database outage.
+            if self.dropped & (self.dropped - 1) == 0:
+                LOGGER.warning("analytics queue full dropped=%s", self.dropped)
+            return False
+
+    def close(self, timeout: float = 6.0) -> bool:
+        self._shutdown_deadline = time.monotonic() + timeout
+        self._stop.set()
+        self._thread.join(timeout=timeout)
+        finished = not self._thread.is_alive()
+        if not finished:
+            LOGGER.warning("analytics shutdown deadline reached pending=%s", self._queue.qsize())
+        return finished
+
+    def _run(self) -> None:
+        while not self._stop.is_set() or not self._queue.empty():
+            if time.monotonic() >= self._shutdown_deadline:
+                break
+            try:
+                batch = [self._queue.get(timeout=self._flush_interval)]
+            except Empty:
+                continue
+            deadline = time.monotonic() + self._flush_interval
+            while len(batch) < self._batch_size:
+                try:
+                    if self._stop.is_set():
+                        batch.append(self._queue.get_nowait())
+                    else:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        batch.append(self._queue.get(timeout=remaining))
+                except Empty:
+                    break
+            try:
+                record_request_analytics_batch(self.db_path, batch)
+                self.written += len(batch)
+            except Exception:
+                self.dropped += len(batch)
+                LOGGER.exception("analytics batch write failed count=%s", len(batch))
+            finally:
+                for _ in batch:
+                    self._queue.task_done()
+        pending = self._queue.qsize()
+        if pending:
+            self.dropped += pending
+            LOGGER.warning("analytics shutdown discarded queued events count=%s", pending)
 
 
 def build_analytics_report(

@@ -13,6 +13,7 @@ import requests
 from app.config import Settings, from_intercity_routeid, is_intercity_city
 from app.logging_utils import get_logger
 from app.route_aliases import get_route_alias_index
+from app.request_budget import budget_lock, budget_sleep, remaining_seconds, request_timeout
 from app.tdx_auth import TDXTokenManager
 
 LOGGER = get_logger("tdx_client")
@@ -44,10 +45,10 @@ class TDXClient:
         if self.settings.tdx_min_request_interval <= 0:
             return
 
-        with self._request_lock:
+        with budget_lock(self._request_lock):
             now = time.monotonic()
             if now < self._next_request_at:
-                time.sleep(self._next_request_at - now)
+                budget_sleep(self._next_request_at - now)
             self._next_request_at = time.monotonic() + self.settings.tdx_min_request_interval
 
     def _retry_delay(self, response: requests.Response | None, attempt: int) -> float:
@@ -80,6 +81,7 @@ class TDXClient:
         last_error: Exception | None = None
 
         for attempt in range(1, self.settings.tdx_retry_attempts + 1):
+            remaining_seconds()
             self._respect_min_interval()
 
             headers = {
@@ -93,8 +95,9 @@ class TDXClient:
                 url,
                 headers=headers,
                 params=params,
-                timeout=self.settings.tdx_request_timeout,
+                timeout=request_timeout(self.settings.tdx_request_timeout),
             )
+            remaining_seconds()
             if response.status_code == 401 and retry_on_401:
                 self.token_manager.invalidate()
                 retry_on_401 = False
@@ -116,7 +119,7 @@ class TDXClient:
                     attempt,
                     self.settings.tdx_retry_attempts,
                 )
-                time.sleep(delay)
+                budget_sleep(delay)
                 continue
 
             if response.status_code >= 500 and attempt < self.settings.tdx_retry_attempts:
@@ -129,7 +132,7 @@ class TDXClient:
                     attempt,
                     self.settings.tdx_retry_attempts,
                 )
-                time.sleep(delay)
+                budget_sleep(delay)
                 continue
 
             try:

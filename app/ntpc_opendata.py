@@ -11,6 +11,7 @@ import requests
 from urllib3.exceptions import InsecureRequestWarning
 
 from app.logging_utils import get_logger
+from app.request_budget import remaining_seconds, request_timeout
 
 
 LOGGER = get_logger("ntpc_opendata")
@@ -122,7 +123,7 @@ class NtpcOpenDataClient:
                 url,
                 params=params,
                 headers=headers,
-                timeout=self.request_timeout,
+                timeout=request_timeout(self.request_timeout),
             )
         except requests.exceptions.SSLError:
             LOGGER.warning(
@@ -135,10 +136,11 @@ class NtpcOpenDataClient:
                     url,
                     params=params,
                     headers=headers,
-                    timeout=self.request_timeout,
+                    timeout=request_timeout(self.request_timeout),
                     verify=False,
                 )
 
+        remaining_seconds()
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, list):

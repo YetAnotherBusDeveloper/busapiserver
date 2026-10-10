@@ -37,7 +37,8 @@ from app.db import (
 )
 from app.logging_utils import get_logger, setup_logging, shutdown_logging
 from app.ntpc_opendata import NtpcOpenDataClient
-from app.request_analytics import record_request_analytics, should_record_analytics
+from app.request_analytics import AnalyticsWriter, should_record_analytics
+from app.request_budget import request_budget
 from app.static_sync_control import StaticSyncCoordinator
 from app.sync_realtime import RealtimeService, RouteBusesService
 from app.sync_static import sync_static
@@ -170,13 +171,12 @@ def _record_request_analytics_safe(request: Request, path: str, status_code: int
     if not should_record_analytics(endpoint):
         return
 
-    settings = getattr(request.app.state, "settings", None)
-    if settings is None:
+    writer = getattr(request.app.state, "analytics_writer", None)
+    if writer is None:
         return
 
     try:
-        record_request_analytics(
-            settings.app_db_path,
+        writer.submit(
             method=request.method,
             endpoint=endpoint,
             path=path,
@@ -241,6 +241,9 @@ async def lifespan(app: FastAPI):
     app.state.scheduler_thread = scheduler_thread
     app.state.tunnel = None
     app.state.tunnel_task = None
+    analytics_writer = AnalyticsWriter(settings.app_db_path)
+    app.state.analytics_writer = analytics_writer
+    analytics_writer.start()
 
     # Nothing in the app depends on the tunnel being up, so let it connect in the
     # background instead of holding startup open for it.
@@ -254,6 +257,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         scheduler_stop_event.set()
+        await asyncio.to_thread(analytics_writer.close)
         scheduler_thread.join(timeout=5)
         ntpc_opendata_client.close()
         tdx_client.close()
@@ -294,6 +298,7 @@ def configure_cors(app: FastAPI, origins: Sequence[str]) -> None:
         # Account sync writes use PUT, so web preflights must advertise it.
         allow_methods=list(CORS_ALLOW_METHODS),
         allow_headers=["*"],
+        expose_headers=["Retry-After"],
     )
 
 
@@ -322,7 +327,8 @@ async def log_requests(request: Request, call_next):
     status_code = 500
 
     try:
-        response = await call_next(request)
+        with request_budget(settings.realtime_request_budget_seconds):
+            response = await call_next(request)
         status_code = response.status_code
     except Exception:
         duration_ms = (time.perf_counter() - started_at) * 1000

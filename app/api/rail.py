@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.logging_utils import get_logger
 from app.rate_limit import enforce_rate_limit
+from app.singleflight import singleflight
 
 LOGGER = get_logger("rail")
 
@@ -99,6 +100,7 @@ def _lerp(start: float, end: float, ratio: float) -> float:
     return start + ((end - start) * ratio)
 
 
+@singleflight
 def _get_tra_station_lookup(request: Request) -> dict[str, dict[str, object]]:
     cache_key = "tra_station_lookup"
     cached = _get_cached(cache_key, STATIC_CACHE_TTL)
@@ -310,7 +312,8 @@ def _finalize_train_position(
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/thsr/stations")
-async def thsr_stations(request: Request):
+@singleflight
+def thsr_stations(request: Request):
     """Get all THSR stations."""
     cache_key = "thsr_stations"
     cached = _get_cached(cache_key, STATIC_CACHE_TTL)
@@ -337,7 +340,8 @@ async def thsr_stations(request: Request):
 
 
 @router.get("/thsr/timetable/od")
-async def thsr_timetable_od(
+@singleflight
+def thsr_timetable_od(
     request: Request,
     origin: str = Query(..., description="Origin station ID"),
     dest: str = Query(..., description="Destination station ID"),
@@ -376,7 +380,8 @@ async def thsr_timetable_od(
 
 
 @router.get("/thsr/timetable/today")
-async def thsr_timetable_today(request: Request):
+@singleflight
+def thsr_timetable_today(request: Request):
     """Get all THSR trains today."""
     cache_key = "thsr_today"
     cached = _get_cached(cache_key, TIMETABLE_CACHE_TTL)
@@ -410,7 +415,8 @@ async def thsr_timetable_today(request: Request):
 
 
 @router.get("/thsr/seats/{station_id}")
-async def thsr_seats(station_id: str, request: Request):
+@singleflight
+def thsr_seats(station_id: str, request: Request):
     """Get real-time seat availability at a THSR station."""
     cache_key = f"thsr_seats_{station_id}"
     cached = _get_cached(cache_key, REALTIME_CACHE_TTL)
@@ -451,7 +457,8 @@ async def thsr_seats(station_id: str, request: Request):
 
 
 @router.get("/thsr/alerts")
-async def thsr_alerts(request: Request):
+@singleflight
+def thsr_alerts(request: Request):
     """Get THSR operational alerts."""
     cache_key = "thsr_alerts"
     cached = _get_cached(cache_key, REALTIME_CACHE_TTL)
@@ -467,7 +474,8 @@ async def thsr_alerts(request: Request):
 
 
 @router.get("/thsr/shape")
-async def thsr_shape(request: Request):
+@singleflight
+def thsr_shape(request: Request):
     """Get THSR route geometry."""
     cache_key = "thsr_shape"
     cached = _get_cached(cache_key, STATIC_CACHE_TTL)
@@ -514,7 +522,8 @@ TRA_LINE_NAMES = {
 
 
 @router.get("/tra/stations")
-async def tra_stations(request: Request):
+@singleflight
+def tra_stations(request: Request):
     """Get all TRA stations."""
     cache_key = "tra_stations"
     cached = _get_cached(cache_key, STATIC_CACHE_TTL)
@@ -541,7 +550,8 @@ async def tra_stations(request: Request):
 
 
 @router.get("/tra/lines")
-async def tra_lines(request: Request):
+@singleflight
+def tra_lines(request: Request):
     """Get all TRA lines."""
     cache_key = "tra_lines"
     cached = _get_cached(cache_key, STATIC_CACHE_TTL)
@@ -565,7 +575,8 @@ async def tra_lines(request: Request):
 
 
 @router.get("/tra/station-of-line")
-async def tra_station_of_line(request: Request):
+@singleflight
+def tra_station_of_line(request: Request):
     """Get the ordered station list of every TRA line."""
     cache_key = "tra_station_of_line"
     cached = _get_cached(cache_key, STATIC_CACHE_TTL)
@@ -602,7 +613,8 @@ async def tra_station_of_line(request: Request):
 
 
 @router.get("/tra/timetable/od")
-async def tra_timetable_od(
+@singleflight
+def tra_timetable_od(
     request: Request,
     origin: str = Query(..., description="Origin station ID"),
     dest: str = Query(..., description="Destination station ID"),
@@ -641,7 +653,8 @@ async def tra_timetable_od(
 
 
 @router.get("/tra/liveboard/{station_id}")
-async def tra_liveboard(station_id: str, request: Request):
+@singleflight
+def tra_liveboard(station_id: str, request: Request):
     """Get real-time arrival/departure at a TRA station."""
     cache_key = f"tra_live_{station_id}"
     cached = _get_cached(cache_key, REALTIME_CACHE_TTL)
@@ -673,7 +686,8 @@ async def tra_liveboard(station_id: str, request: Request):
 
 
 @router.get("/tra/train-positions/{station_id}")
-async def tra_train_positions(
+@singleflight
+def tra_train_positions(
     station_id: str,
     request: Request,
     limit: int = Query(8, ge=1, le=20, description="Maximum trains to estimate"),
@@ -725,7 +739,8 @@ async def tra_train_positions(
 
 
 @router.get("/tra/shape")
-async def tra_shape(request: Request):
+@singleflight
+def tra_shape(request: Request):
     """Get TRA route geometry."""
     cache_key = "tra_shape"
     cached = _get_cached(cache_key, STATIC_CACHE_TTL)
@@ -748,7 +763,8 @@ async def tra_shape(request: Request):
 
 
 @router.get("/tra/alerts")
-async def tra_alerts(request: Request):
+@singleflight
+def tra_alerts(request: Request):
     """Get TRA operational alerts (derived from LiveTrainDelay)."""
     cache_key = "tra_alerts"
     cached = _get_cached(cache_key, REALTIME_CACHE_TTL)

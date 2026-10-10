@@ -6,6 +6,7 @@ import time
 import requests
 
 from app.config import Settings
+from app.request_budget import budget_lock, remaining_seconds, request_timeout
 
 
 class TDXTokenManager:
@@ -22,7 +23,7 @@ class TDXTokenManager:
         if self._access_token and now < self._expires_at - self.settings.tdx_token_refresh_skew:
             return self._access_token
 
-        with self._lock:
+        with budget_lock(self._lock):
             now = time.time()
             if self._access_token and now < self._expires_at - self.settings.tdx_token_refresh_skew:
                 return self._access_token
@@ -35,8 +36,9 @@ class TDXTokenManager:
                     "client_id": self.settings.tdx_client_id,
                     "client_secret": self.settings.tdx_client_secret,
                 },
-                timeout=self.settings.tdx_request_timeout,
+                timeout=request_timeout(self.settings.tdx_request_timeout),
             )
+            remaining_seconds()
             response.raise_for_status()
 
             payload = response.json()

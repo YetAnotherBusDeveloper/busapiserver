@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import tempfile
 import time
+import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.db import init_app_db, init_db
 from app.request_analytics import (
@@ -11,6 +13,7 @@ from app.request_analytics import (
     parse_user_agent,
     record_request_analytics,
     should_record_analytics,
+    AnalyticsWriter,
 )
 
 
@@ -100,6 +103,51 @@ class AnalyticsTests(unittest.TestCase):
     def test_should_skip_admin_analytics_routes(self) -> None:
         self.assertFalse(should_record_analytics("/admin/analytics"))
         self.assertFalse(should_record_analytics("/api/v1/admin/analytics"))
+
+    def test_writer_flushes_accepted_events_on_shutdown(self) -> None:
+        writer = AnalyticsWriter(self.app_db_path, flush_interval=0.01)
+        writer.start()
+        for _ in range(5):
+            self.assertTrue(writer.submit(method="GET", endpoint="/route", path="/route",
+                                          status_code=200, user_agent="YABus/1.0 (Android)"))
+        self.assertTrue(writer.close())
+        self.assertEqual(writer.written, 5)
+        self.assertEqual(build_analytics_report(self.app_db_path)["summary"]["total_requests"], 5)
+        self.assertFalse(writer.submit(method="GET", endpoint="/route", path="/route",
+                                       status_code=200, user_agent=None))
+
+    def test_slow_database_does_not_block_submit_and_queue_is_bounded(self) -> None:
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_write(*_args):
+            entered.set()
+            release.wait(3)
+
+        writer = AnalyticsWriter(self.app_db_path, capacity=1, batch_size=1)
+        event = dict(method="GET", endpoint="/route", path="/route", status_code=200, user_agent=None)
+        with patch("app.request_analytics.record_request_analytics_batch", side_effect=slow_write):
+            writer.start()
+            try:
+                self.assertTrue(writer.submit(**event))
+                self.assertTrue(entered.wait(1))
+                self.assertTrue(writer.submit(**event))
+                self.assertFalse(writer.submit(**event))
+                self.assertEqual(writer.dropped, 1)
+            finally:
+                release.set()
+                self.assertTrue(writer.close())
+
+    def test_failed_write_does_not_stop_the_background_writer(self) -> None:
+        writer = AnalyticsWriter(self.app_db_path, batch_size=1)
+        event = dict(method="GET", endpoint="/route", path="/route", status_code=200, user_agent=None)
+        with patch("app.request_analytics.record_request_analytics_batch",
+                   side_effect=[RuntimeError("database busy"), None]):
+            writer.start()
+            writer.submit(**event)
+            writer.submit(**event)
+            self.assertTrue(writer.close())
+        self.assertEqual(writer.written, 1)
+        self.assertEqual(writer.dropped, 1)
 
     def test_should_skip_the_city_bus_map_poll(self) -> None:
         # The map polls this every ~15 s per open screen; recording every poll

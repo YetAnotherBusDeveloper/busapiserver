@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.logging_utils import get_logger
 from app.rate_limit import enforce_rate_limit
+from app.singleflight import singleflight
 
 LOGGER = get_logger("bike")
 
@@ -69,6 +70,7 @@ def _get_tdx(request: Request):
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+@singleflight
 def _fetch_stations_raw(tdx, city: str) -> list[dict]:
     cache_key = f"bike_stations_raw_{city}"
     cached = _get_cached(cache_key, STATION_CACHE_TTL)
@@ -79,6 +81,7 @@ def _fetch_stations_raw(tdx, city: str) -> list[dict]:
     return raw
 
 
+@singleflight
 def _fetch_availability_raw(tdx, city: str) -> list[dict]:
     cache_key = f"bike_avail_raw_{city}"
     cached = _get_cached(cache_key, AVAILABILITY_CACHE_TTL)
@@ -129,7 +132,8 @@ async def list_cities():
 
 
 @router.get("/stations")
-async def get_stations(
+@singleflight
+def get_stations(
     request: Request,
     city: str = Query(..., description="City name, e.g. Taipei"),
     lat: float = Query(0, description="Latitude for distance sorting"),
@@ -179,7 +183,8 @@ async def get_stations(
 
 
 @router.get("/nearby")
-async def get_nearby(
+@singleflight
+def get_nearby(
     request: Request,
     lat: float = Query(..., description="Latitude"),
     lon: float = Query(..., description="Longitude"),

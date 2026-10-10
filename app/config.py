@@ -194,6 +194,7 @@ class Settings:
     # 1000 pages everything without a silent cap.
     city_buses_page_size: int = 1000
     city_buses_rate_limit_requests: int = 30
+    realtime_request_budget_seconds: float = 10.0
 
     def __post_init__(self) -> None:
         if self.app_db_path is None:
@@ -312,6 +313,9 @@ class Settings:
             city_buses_rate_limit_requests=int(
                 os.getenv("CITY_BUSES_RATE_LIMIT_REQUESTS", "30")
             ),
+            realtime_request_budget_seconds=max(0.1, float(
+                os.getenv("REALTIME_REQUEST_BUDGET_SECONDS", "10")
+            )),
         )
 
     def require_tdx_credentials(self) -> None:
