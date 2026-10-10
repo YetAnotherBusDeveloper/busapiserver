@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import threading
 import unittest
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -187,6 +188,70 @@ class RealtimeBackfillTests(unittest.TestCase):
             self.assertIn("TXG307", first.result(timeout=5))
             self.assertIn("TXG307", second.result(timeout=5))
         self.assertEqual(fetch.call_count, 1)
+
+    def test_eta_reference_and_source_time_survive_cache_and_304(self) -> None:
+        source_time = datetime.fromisoformat("2026-10-10T08:00:00+08:00").timestamp()
+        self.client.eta_payload_by_route["TXG307"] = [{
+            "SubRouteUID": "TXG307", "Direction": 0, "StopID": "STOP1",
+            "EstimateTime": 120, "UpdateTime": "2026-10-10T08:00:00+08:00",
+        }]
+        service, _ = self._build_services()
+        with patch("app.sync_realtime.time.time", return_value=source_time + 35):
+            first = service.get_snapshot("TXG307")
+        stop = first["paths"][0]["stops"][0]
+        self.assertEqual(stop["eta"], 85)
+        self.assertEqual(stop["updated_at"], source_time)
+        self.assertEqual(stop["eta_reference_at"], source_time + 35)
+        with patch("app.sync_realtime.time.time", return_value=source_time + 50), \
+             patch.object(self.client, "fetch_estimated_time_of_arrival_batch",
+                          return_value=TDXJSONResponse(None, 304, None)):
+            second = service.get_snapshot("TXG307")
+        self.assertEqual(second["paths"], first["paths"])
+        self.assertEqual(service._cache["TXG307"].fetched_at, source_time + 35)
+
+    def test_repeated_failures_cannot_extend_stale_snapshot_lifetime(self) -> None:
+        service, _ = self._build_services()
+        with patch("app.sync_realtime.time.time", return_value=1000):
+            service.get_snapshot("TXG307")
+        with patch.object(self.client, "fetch_estimated_time_of_arrival_batch",
+                          side_effect=RuntimeError("offline")):
+            for now in (1010, 1040, 1089):
+                with patch("app.sync_realtime.time.time", return_value=now):
+                    self.assertTrue(service.get_snapshot("TXG307")["stale"])
+                    self.assertIn("TXG307", service.get_batch_snapshots(["TXG307"]))
+            with patch("app.sync_realtime.time.time", return_value=1091):
+                with self.assertRaises(RuntimeError):
+                    service.get_snapshot("TXG307")
+                self.assertEqual(service.get_batch_snapshots(["TXG307"]), {})
+
+    def test_old_source_data_is_expired_even_after_successful_fetch(self) -> None:
+        source_time = datetime.fromisoformat("2026-10-10T08:00:00+08:00").timestamp()
+        self.client.eta_payload_by_route["TXG307"] = [{
+            "SubRouteUID": "TXG307", "Direction": 0, "StopID": "STOP1",
+            "EstimateTime": 0, "UpdateTime": "2026-10-10T08:00:00+08:00",
+        }]
+        service, _ = self._build_services()
+        with patch("app.sync_realtime.time.time", return_value=source_time + 91):
+            snapshot = service.get_snapshot("TXG307")
+        self.assertTrue(snapshot["stale"])
+        self.assertIsNone(snapshot["paths"][0]["stops"][0]["eta"])
+
+    def test_vehicle_failure_preserves_successful_eta_without_seeding_map_cache(self) -> None:
+        source_time = datetime.fromisoformat("2026-10-10T08:00:00+08:00").timestamp()
+        self.client.eta_payload_by_route["TXG307"] = [{
+            "SubRouteUID": "TXG307", "Direction": 0, "StopID": "STOP1",
+            "EstimateTime": 120, "UpdateTime": "2026-10-10T08:00:00+08:00",
+        }]
+        for mode in ("single", "batch"):
+            with self.subTest(mode=mode):
+                service, buses = self._build_services()
+                with patch("app.sync_realtime.time.time", return_value=source_time + 10), \
+                     patch.object(self.client, "fetch_realtime_by_frequency_batch",
+                                  side_effect=TimeoutError("GPS feed unavailable")):
+                    snapshot = (service.get_snapshot("TXG307") if mode == "single"
+                                else service.get_batch_snapshots(["TXG307"])["TXG307"])
+                self.assertEqual(snapshot["paths"][0]["stops"][0]["eta"], 110)
+                self.assertNotIn("TXG307", buses._cache)
 
     def test_batch_only_refreshes_routes_still_missing_after_lock(self) -> None:
         self._seed_route("TXG308")
@@ -647,7 +712,8 @@ class RealtimeBackfillTests(unittest.TestCase):
             self.assertEqual(stop["buses"], [])
             self.assertEqual(stop["etas"], [])
 
-    def test_does_not_duplicate_native_plate(self) -> None:
+    @patch("app.sync_realtime.time.time", return_value=datetime.fromisoformat("2026-06-22T10:00:05+08:00").timestamp())
+    def test_does_not_duplicate_native_plate(self, _clock) -> None:
         routeid = "TXG307"
         self.client.eta_payload_by_route[routeid] = [
             {
