@@ -1821,7 +1821,8 @@ class RealtimeService:
             for stop in path.get("stops", []):
                 source_time = stop.get("updated_at") or snapshot.get("eta_reference_at")
                 if source_time is not None and now - source_time > REALTIME_MAX_AGE_SECONDS:
-                    stop.update(eta=None, etas=[], buses=[], message="", stale=True)
+                    # Retain the last known ETA/buses instead of blanking them:
+                    # the client keeps showing them, so just flag the snapshot.
                     snapshot["stale"] = True
         return snapshot
 

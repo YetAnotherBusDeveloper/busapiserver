@@ -224,7 +224,7 @@ class RealtimeBackfillTests(unittest.TestCase):
                     service.get_snapshot("TXG307")
                 self.assertEqual(service.get_batch_snapshots(["TXG307"]), {})
 
-    def test_old_source_data_is_expired_even_after_successful_fetch(self) -> None:
+    def test_old_source_data_is_retained_and_flagged_stale(self) -> None:
         source_time = datetime.fromisoformat("2026-10-10T08:00:00+08:00").timestamp()
         self.client.eta_payload_by_route["TXG307"] = [{
             "SubRouteUID": "TXG307", "Direction": 0, "StopID": "STOP1",
@@ -234,7 +234,8 @@ class RealtimeBackfillTests(unittest.TestCase):
         with patch("app.sync_realtime.time.time", return_value=source_time + 91):
             snapshot = service.get_snapshot("TXG307")
         self.assertTrue(snapshot["stale"])
-        self.assertIsNone(snapshot["paths"][0]["stops"][0]["eta"])
+        self.assertEqual(snapshot["paths"][0]["stops"][0]["eta"], -1)
+
 
     def test_vehicle_failure_preserves_successful_eta_without_seeding_map_cache(self) -> None:
         source_time = datetime.fromisoformat("2026-10-10T08:00:00+08:00").timestamp()
