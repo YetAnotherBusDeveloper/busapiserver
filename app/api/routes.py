@@ -694,6 +694,16 @@ def _normalize_station_city(city: str) -> str:
 # and the risk of swallowing the far kerb starts to rise.
 _STATION_SIDE_MERGE_METERS = 10.0
 
+# TDX's 站位 (Station) is one kerb — "將道路同側、附近同一集群的站牌聚合過後的
+# 抽象點位" — so the far side of the road is a separate Station sharing the name.
+# Serving a single Station showed riders one direction only: 中和(公安路) is
+# TXG6572 (往麗寶樂園) plus TXG6571 (往高鐵臺中站), 8.5 m apart. Same-name
+# stations chained within this distance are one stop to a passenger. Measured
+# against production, 90% of same-name links are under 100 m and the tail
+# thins out by 300 m, while same-name stations that are genuinely different
+# places sit kilometres apart.
+_STATION_SIBLING_METERS = 300.0
+
 
 def _rough_distance_meters(
     lat1: float, lon1: float, lat2: float, lon2: float
@@ -742,6 +752,61 @@ def _cluster_station_sides(side_rows: Collection) -> list[list]:
     return clusters
 
 
+def _station_group_members(connection, *, city_code: str, station) -> list:
+    """The requested station plus same-name stations chained within range.
+
+    Single linkage keeps the grouping symmetric: every member returns the same
+    set of sides whichever one the client asked for. The requested station
+    comes first and the rest follow by distance from it, so side A is always
+    the kerb the rider picked.
+    """
+    origin_lat, origin_lon = float(station["lat"]), float(station["lon"])
+    if origin_lat == 0.0 and origin_lon == 0.0:
+        return [station]
+    pending = [
+        row
+        for row in connection.execute(
+            """
+            SELECT station_id, lat, lon
+            FROM stations
+            WHERE city_code = ? AND name = ? AND station_id != ?
+            """,
+            (city_code, station["name"], station["station_id"]),
+        ).fetchall()
+        if float(row["lat"]) != 0.0 or float(row["lon"]) != 0.0
+    ]
+    members = [station]
+    frontier = [station]
+    while frontier and pending:
+        current = frontier.pop()
+        remaining = []
+        for row in pending:
+            if (
+                _rough_distance_meters(
+                    float(current["lat"]),
+                    float(current["lon"]),
+                    float(row["lat"]),
+                    float(row["lon"]),
+                )
+                <= _STATION_SIBLING_METERS
+            ):
+                members.append(row)
+                frontier.append(row)
+            else:
+                remaining.append(row)
+        pending = remaining
+    siblings = sorted(
+        members[1:],
+        key=lambda row: (
+            _rough_distance_meters(
+                origin_lat, origin_lon, float(row["lat"]), float(row["lon"])
+            ),
+            row["station_id"],
+        ),
+    )
+    return [station, *siblings]
+
+
 def _station_passby_payload(
     request: Request,
     *,
@@ -764,20 +829,28 @@ def _station_passby_payload(
                 detail=f"Station {station_id} was not found.",
             )
 
+        member_ids = [
+            row["station_id"]
+            for row in _station_group_members(
+                connection, city_code=city_code, station=station
+            )
+        ]
+        placeholders = ", ".join("?" for _ in member_ids)
         side_rows = connection.execute(
-            """
-            SELECT side_id, side_order, side_label, stop_uid, stop_id,
-                   direction, lat, lon
+            f"""
+            SELECT station_id, side_id, side_order, side_label, stop_uid,
+                   stop_id, direction, lat, lon
             FROM station_stops
-            WHERE city_code = ? AND station_id = ?
-            ORDER BY side_order, side_id
+            WHERE city_code = ? AND station_id IN ({placeholders})
             """,
-            (city_code, station_id),
+            (city_code, *member_ids),
         ).fetchall()
         route_rows = connection.execute(
-            """
+            f"""
             SELECT
+                ss.station_id AS station_id,
                 ss.side_id AS side_id,
+                ss.side_order AS side_order,
                 s.routeid AS routeid,
                 s.pathid AS pathid,
                 s.seq AS seq,
@@ -793,11 +866,28 @@ def _station_passby_payload(
             JOIN routes r ON r.routeid = s.routeid
             LEFT JOIN paths p
               ON p.routeid = s.routeid AND p.pathid = s.pathid
-            WHERE ss.city_code = ? AND ss.station_id = ?
-            ORDER BY ss.side_order, s.routeid, s.pathid, s.seq
+            WHERE ss.city_code = ? AND ss.station_id IN ({placeholders})
             """,
-            (f"{city_code}%", city_code, station_id),
+            (f"{city_code}%", city_code, *member_ids),
         ).fetchall()
+
+    member_rank = {member_id: index for index, member_id in enumerate(member_ids)}
+    side_rows.sort(
+        key=lambda row: (
+            member_rank[row["station_id"]],
+            row["side_order"],
+            row["side_id"],
+        )
+    )
+    route_rows.sort(
+        key=lambda row: (
+            member_rank[row["station_id"]],
+            row["side_order"],
+            row["routeid"],
+            row["pathid"],
+            row["seq"],
+        )
+    )
 
     ordered_routeids: list[str] = []
     seen_routeids: set[str] = set()
@@ -817,8 +907,8 @@ def _station_passby_payload(
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail="TDX upstream request failed.") from exc
 
-    routes_by_side: dict[str, list[dict]] = {
-        row["side_id"]: [] for row in side_rows
+    routes_by_side: dict[tuple[str, str], list[dict]] = {
+        (row["station_id"], row["side_id"]): [] for row in side_rows
     }
     for row in route_rows:
         routeid = row["routeid"]
@@ -827,7 +917,7 @@ def _station_passby_payload(
         pathid = int(row["pathid"])
         stopid = row["stopid"]
         stop_bucket = _find_snapshot_stop(snapshots.get(routeid), pathid, stopid)
-        routes_by_side[row["side_id"]].append(
+        routes_by_side[(row["station_id"], row["side_id"])].append(
             {
                 "routeid": routeid,
                 "route_name": row["route_name"],
@@ -845,6 +935,16 @@ def _station_passby_payload(
                 "etas": (stop_bucket or {}).get("etas", []),
             }
         )
+
+    # Pole merging stays inside one station: a sibling station is the far kerb
+    # by definition, even when TDX places it within the merge radius.
+    clusters = [
+        cluster
+        for member_id in member_ids
+        for cluster in _cluster_station_sides(
+            [row for row in side_rows if row["station_id"] == member_id]
+        )
+    ]
 
     return {
         "city": city_code,
@@ -870,10 +970,12 @@ def _station_passby_payload(
                 "routes": [
                     route
                     for row in cluster
-                    for route in routes_by_side.get(row["side_id"], [])
+                    for route in routes_by_side.get(
+                        (row["station_id"], row["side_id"]), []
+                    )
                 ],
             }
-            for index, cluster in enumerate(_cluster_station_sides(side_rows))
+            for index, cluster in enumerate(clusters)
         ],
     }
 

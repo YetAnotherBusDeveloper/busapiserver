@@ -127,12 +127,13 @@ class StationPassbyApiTests(unittest.TestCase):
     ) -> None:
         with get_connection(self.db_path) as connection:
             with connection:
+                # OR IGNORE lets one route be seeded once per direction.
                 connection.execute(
-                    "INSERT INTO routes (routeid, name, name_en) VALUES (?, ?, ?)",
+                    "INSERT OR IGNORE INTO routes (routeid, name, name_en) VALUES (?, ?, ?)",
                     (routeid, route_name, route_name),
                 )
                 connection.execute(
-                    "INSERT INTO paths (routeid, pathid, name, name_en) VALUES (?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO paths (routeid, pathid, name, name_en) VALUES (?, ?, ?, ?)",
                     (routeid, pathid, "往終點", "Outbound"),
                 )
                 connection.execute(
@@ -142,6 +143,35 @@ class StationPassbyApiTests(unittest.TestCase):
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (routeid, pathid, seq, stopid, "市政府", "City Hall", lat, lon),
+                )
+
+    def _replace_single_stop_stations(
+        self, city_code: str, stations: list[tuple[str, str, str, float, float]]
+    ) -> None:
+        """Seed (station_id, name, stopid, lat, lon) stations, one kerb each."""
+        with get_connection(self.db_path) as connection:
+            with connection:
+                _replace_bus_stations(
+                    connection,
+                    city_code,
+                    [
+                        {
+                            "StationUID": station_id,
+                            "StationName": {"Zh_tw": name},
+                            "StationPosition": {
+                                "PositionLat": lat,
+                                "PositionLon": lon,
+                            },
+                            "Stops": [
+                                {
+                                    "StopUID": f"{city_code}{stopid}",
+                                    "StopID": stopid,
+                                    "StopName": {"Zh_tw": name},
+                                }
+                            ],
+                        }
+                        for station_id, name, stopid, lat, lon in stations
+                    ],
                 )
 
     @staticmethod
@@ -263,6 +293,72 @@ class StationPassbyApiTests(unittest.TestCase):
         self.assertEqual(
             [route["stopid"] for route in body["sides"][0]["routes"]],
             ["STOP-A", "STOP-A2", "STOP-A3"],
+        )
+
+    def test_far_kerb_station_with_the_same_name_becomes_another_side(self) -> None:
+        # The 中和(公安路) shape. TDX's Station is one kerb, so the stop is two
+        # same-name Stations, each serving one direction, 8.5 m apart — inside
+        # the pole-merge radius, yet they must stay two sides.
+        for routeid, name in (("TXG155", "155"), ("TXG92", "92")):
+            self._seed_route(routeid, name, "10079", 0, 30, lat=24.310417, lon=120.698049)
+            self._seed_route(routeid, name, "10082", 1, 9, lat=24.310371, lon=120.697982)
+        self._replace_single_stop_stations(
+            "TXG",
+            [
+                ("TXG6571", "中和(公安路)", "10082", 24.310371, 120.697982),
+                ("TXG6572", "中和(公安路)", "10079", 24.310417, 120.698049),
+                # Same name in another district is a different stop...
+                ("TXG9001", "中和(公安路)", "20001", 24.25, 120.70),
+                # ...and so is the neighbouring station under another name.
+                ("TXG9002", "公安路口", "20002", 24.3105, 120.6981),
+            ],
+        )
+
+        picked = self.client.get("/api/v1/stations/TXG6572/passby?city=TXG").json()
+        resolved = self.client.get(
+            "/api/v1/stations/resolve?city=TXG&stopid=10082"
+        ).json()
+
+        self.assertEqual(picked["station_id"], "TXG6572")
+        self.assertEqual([side["label"] for side in picked["sides"]], ["A", "B"])
+        # Side A is always the kerb that was asked for.
+        self.assertEqual(
+            [side["stopid"] for side in picked["sides"]], ["10079", "10082"]
+        )
+        self.assertEqual(
+            [
+                [(route["route_name"], route["pathid"]) for route in side["routes"]]
+                for side in picked["sides"]
+            ],
+            [[("155", 0), ("92", 0)], [("155", 1), ("92", 1)]],
+        )
+        self.assertEqual(resolved["station_id"], "TXG6571")
+        self.assertEqual(
+            [side["stopid"] for side in resolved["sides"]], ["10082", "10079"]
+        )
+
+    def test_same_name_stations_chain_into_one_group_from_either_end(self) -> None:
+        # ~250 m apart in a row: the ends are ~500 m from each other, but every
+        # member must see the same sides, whichever station the rider picked.
+        self._replace_single_stop_stations(
+            "TXG",
+            [
+                ("TXG-NORTH", "中友百貨", "S-NORTH", 24.15450, 120.68),
+                ("TXG-MID", "中友百貨", "S-MID", 24.15225, 120.68),
+                ("TXG-SOUTH", "中友百貨", "S-SOUTH", 24.15000, 120.68),
+            ],
+        )
+
+        north = self.client.get("/api/v1/stations/TXG-NORTH/passby?city=TXG").json()
+        south = self.client.get("/api/v1/stations/TXG-SOUTH/passby?city=TXG").json()
+
+        self.assertEqual(
+            [side["stopid"] for side in north["sides"]],
+            ["S-NORTH", "S-MID", "S-SOUTH"],
+        )
+        self.assertEqual(
+            [side["stopid"] for side in south["sides"]],
+            ["S-SOUTH", "S-MID", "S-NORTH"],
         )
 
     def test_resolve_is_city_scoped_without_name_or_distance_fallback(self) -> None:
