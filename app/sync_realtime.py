@@ -9,10 +9,12 @@ import math
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 from pathlib import Path
+
+import requests
 
 from app.config import INTERCITY_CITY_NAME, Settings, get_settings, guess_city_from_routeid, to_intercity_routeid
 from app.db import (
@@ -26,7 +28,7 @@ from app.db import (
 from app.logging_utils import get_logger, setup_logging, shutdown_logging
 from app.ntpc_opendata import NtpcOpenDataClient
 from app.route_aliases import get_route_alias_index
-from app.request_budget import budget_lock, realtime_budget
+from app.request_budget import budget_lock, realtime_budget, remaining_seconds, request_budget
 from app.tdx_auth import TDXTokenManager
 from app.tdx_client import TDXClient, TDXJSONResponse
 
@@ -86,6 +88,14 @@ class CacheEntry:
     expires_at: float
     fetched_at: float
     stale: bool = False
+
+
+@dataclass
+class _EtaFirstLoad:
+    routeid: str
+    ready: threading.Event = field(default_factory=threading.Event)
+    preview: dict[str, Any] | None = None
+    error: Exception | None = None
 
 
 @dataclass
@@ -1100,9 +1110,20 @@ class RealtimeService:
         self._tracked_routes_lock = threading.Lock()
         self._city_refresh_locks: dict[str, threading.Lock] = {}
         self._city_refresh_locks_guard = threading.Lock()
+        self._background_refreshing_cities: set[str] = set()
+        self._background_refresh_lock = threading.Lock()
+        self._eta_first_loads: dict[str, _EtaFirstLoad] = {}
+        self._eta_first_lock = threading.Lock()
 
     @realtime_budget
-    def get_snapshot(self, routeid: str, *, force_refresh: bool = False) -> dict[str, Any]:
+    def get_snapshot(
+        self,
+        routeid: str,
+        *,
+        force_refresh: bool = False,
+        prefer_cached: bool = False,
+        schedule_travel_time_update: Callable[[Callable[[], None]], None] | None = None,
+    ) -> dict[str, Any]:
         # A routeid absorbed by a direction merge still has to resolve, or every
         # favorite and widget pointing at the return direction goes dark.
         routeid = get_route_alias_index(self.settings).canonical(routeid)
@@ -1120,6 +1141,14 @@ class RealtimeService:
             cached = self._get_cached(routeid)
             if cached is not None:
                 return cached
+            if prefer_cached:
+                recent = self._get_cached(routeid, allow_expired=True)
+                if recent is not None and self._has_usable_recent_eta(recent):
+                    self._refresh_city_in_background(city, routeid, static_route)
+                    return dict(recent, stale=True)
+                eta_first = self._get_eta_first_snapshot(city, routeid, static_route)
+                if eta_first is not None:
+                    return eta_first
 
         city_lock = self._get_city_refresh_lock(city)
         with budget_lock(city_lock):
@@ -1129,7 +1158,13 @@ class RealtimeService:
                     return cached
 
             try:
-                self._refresh_city_cache(city, routeid, static_route, force_refresh=force_refresh)
+                self._refresh_city_cache(
+                    city,
+                    routeid,
+                    static_route,
+                    force_refresh=force_refresh,
+                    schedule_travel_time_update=schedule_travel_time_update,
+                )
             except Exception:
                 stale = self._get_cached(routeid, allow_expired=True)
                 if stale is not None:
@@ -1147,6 +1182,124 @@ class RealtimeService:
                 return cached
 
         return self._build_snapshot(routeid, static_route, [])
+
+    def _get_eta_first_snapshot(
+        self, city: str, routeid: str, static_route: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Share one city refresh; return native ETA before optional GPS arrives."""
+        with self._eta_first_lock:
+            load = self._eta_first_loads.get(city)
+            if load is not None and load.routeid != routeid:
+                # Another route is already loading. The normal city lock below
+                # will join it without spawning a second waiting worker.
+                return None
+            start_worker = load is None
+            if load is None:
+                load = _EtaFirstLoad(routeid)
+                self._eta_first_loads[city] = load
+
+        if start_worker:
+            def eta_ready(snapshot: dict[str, Any]) -> None:
+                load.preview = dict(snapshot, partial=True)
+                load.ready.set()
+
+            def refresh() -> None:
+                try:
+                    with request_budget(self.settings.realtime_request_budget_seconds):
+                        with budget_lock(self._get_city_refresh_lock(city)):
+                            if self._get_cached(routeid) is None:
+                                self._refresh_city_cache(
+                                    city, routeid, static_route, force_refresh=False,
+                                    on_eta_ready=eta_ready,
+                                )
+                except Exception as exc:
+                    load.error = exc
+                finally:
+                    with self._eta_first_lock:
+                        if self._eta_first_loads.get(city) is load:
+                            self._eta_first_loads.pop(city)
+                    load.ready.set()
+
+            try:
+                threading.Thread(
+                    target=refresh, name=f"eta-first-{city}", daemon=True,
+                ).start()
+            except Exception as exc:
+                load.error = exc
+                with self._eta_first_lock:
+                    if self._eta_first_loads.get(city) is load:
+                        self._eta_first_loads.pop(city)
+                load.ready.set()
+
+        remaining = remaining_seconds()
+        if not load.ready.wait(remaining):
+            raise requests.Timeout("ETA-first refresh exceeded request budget")
+        if load.preview is not None:
+            return load.preview
+        if load.error is not None:
+            stale = self._get_cached(routeid, allow_expired=True)
+            if stale is not None:
+                self._revalidate_cached(routeid, stale=True)
+                return dict(stale, stale=True)
+            raise load.error
+        return self._get_cached(routeid, allow_expired=True)
+
+    @staticmethod
+    def _has_usable_recent_eta(snapshot: dict[str, Any]) -> bool:
+        """Only reuse an expired cache entry if its ETA source is still recent."""
+        now = time.time()
+        found_eta = False
+        for path in snapshot.get("paths", []):
+            for stop in path.get("stops", []):
+                if stop.get("eta") is None and not stop.get("message") and not stop.get("etas"):
+                    continue
+                source_time = stop.get("updated_at")
+                if source_time is None or not isinstance(source_time, (float, int)):
+                    return False
+                if source_time > now + 15 or now - source_time > REALTIME_MAX_AGE_SECONDS:
+                    return False
+                found_eta = True
+        return found_eta
+
+    def _refresh_city_in_background(
+        self, city: str, routeid: str, static_route: dict[str, Any]
+    ) -> None:
+        # Only one refresh per city. _refresh_city_cache includes all recently
+        # tracked routes, so simultaneous viewers share the same upstream work.
+        with self._background_refresh_lock:
+            if city in self._background_refreshing_cities:
+                return
+            self._background_refreshing_cities.add(city)
+
+        def refresh() -> None:
+            try:
+                with request_budget(self.settings.realtime_request_budget_seconds):
+                    with budget_lock(self._get_city_refresh_lock(city)):
+                        if self._get_cached(routeid) is None:
+                            self._refresh_city_cache(
+                                city, routeid, static_route, force_refresh=False
+                            )
+            except Exception as exc:
+                LOGGER.warning(
+                    "background realtime refresh failed city=%s routeid=%s error=%s",
+                    city, routeid, exc,
+                )
+                self._revalidate_cached(routeid, stale=True)
+            finally:
+                with self._background_refresh_lock:
+                    self._background_refreshing_cities.discard(city)
+
+        try:
+            threading.Thread(
+                target=refresh, name=f"realtime-{city}", daemon=True,
+            ).start()
+        except Exception as exc:
+            with self._background_refresh_lock:
+                self._background_refreshing_cities.discard(city)
+            LOGGER.warning(
+                "background realtime refresh could not start city=%s routeid=%s error=%s",
+                city, routeid, exc,
+            )
 
     @realtime_budget
     def get_batch_snapshots(self, routeids: list[str]) -> dict[str, dict[str, Any]]:
@@ -1395,7 +1548,10 @@ class RealtimeService:
         requested_static_route: dict[str, Any],
         *,
         force_refresh: bool,
+        schedule_travel_time_update: Callable[[Callable[[], None]], None] | None = None,
+        on_eta_ready: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
+        started_at = time.perf_counter()
         routeids = self._get_tracked_routeids(city, include_routeid=requested_routeid)
         static_routes = self._load_static_routes(routeids, requested_routeid, requested_static_route)
         if requested_routeid not in static_routes:
@@ -1425,6 +1581,7 @@ class RealtimeService:
             _persist_fetch_state(connection, resource_key, response, checked_at, previous_state)
             _prune_old_realtime_fetch_state(connection, checked_at)
             connection.commit()
+        eta_done_at = time.perf_counter()
 
         if response.not_modified:
             LOGGER.info(
@@ -1432,6 +1589,10 @@ class RealtimeService:
                 city,
                 len(effective_routeids),
                 requested_routeid,
+            )
+            LOGGER.info(
+                "realtime refresh timing city=%s routes=%s status=304 eta_stage_ms=%.1f",
+                city, len(effective_routeids), (eta_done_at - started_at) * 1000,
             )
             for routeid, snapshot in stale_snapshots.items():
                 if snapshot is not None:
@@ -1447,12 +1608,31 @@ class RealtimeService:
             len(response.payload or []),
         )
 
-        buses_response = self._fetch_optional_buses(city, effective_routeids)
         items_by_route: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for item in response.payload or []:
             routeid = _tdx_item_to_local(city, item, settings=self.settings)
             if routeid in static_routes:
                 items_by_route[routeid].append(item)
+
+        if on_eta_ready is not None and items_by_route.get(requested_routeid):
+            try:
+                preview = self._build_snapshot(
+                    requested_routeid, requested_static_route,
+                    items_by_route[requested_routeid], realtime_buses=[],
+                    update_plate_states=False,
+                )
+                if self._has_usable_recent_eta(preview):
+                    on_eta_ready(preview)
+                    LOGGER.info(
+                        "realtime early ETA ready city=%s routeid=%s elapsed_ms=%.1f",
+                        city, requested_routeid, (time.perf_counter() - started_at) * 1000,
+                    )
+            except Exception as exc:
+                LOGGER.warning("early ETA unavailable routeid=%s error=%s", requested_routeid, exc)
+
+        preview_done_at = time.perf_counter()
+        buses_response = self._fetch_optional_buses(city, effective_routeids)
+        buses_done_at = time.perf_counter()
 
         buses_by_route: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for item in (buses_response.payload if buses_response is not None else []) or []:
@@ -1472,7 +1652,30 @@ class RealtimeService:
                 realtime_buses=buses,
             )
             self._set_cached(routeid, snapshot)
-            _extract_and_store_eta_travel_times(snapshot, static_route, self.settings.db_path)
+            if schedule_travel_time_update is None:
+                _extract_and_store_eta_travel_times(snapshot, static_route, self.settings.db_path)
+            else:
+                # The current ETA and backfill have already been calculated.
+                # Learning future travel times need not hold up this response.
+                def persist_travel_times(
+                    result: dict[str, Any] = snapshot,
+                    route: dict[str, Any] = static_route,
+                ) -> None:
+                    try:
+                        _extract_and_store_eta_travel_times(result, route, self.settings.db_path)
+                    except Exception:
+                        LOGGER.exception("deferred ETA travel times failed routeid=%s", result["routeid"])
+
+                schedule_travel_time_update(persist_travel_times)
+        LOGGER.info(
+            "realtime refresh timing city=%s routes=%s eta_stage_ms=%.1f preview_ms=%.1f buses_ms=%.1f "
+            "snapshot_ms=%.1f total_ms=%.1f",
+            city, len(effective_routeids), (eta_done_at - started_at) * 1000,
+            (preview_done_at - eta_done_at) * 1000,
+            (buses_done_at - preview_done_at) * 1000,
+            (time.perf_counter() - buses_done_at) * 1000,
+            (time.perf_counter() - started_at) * 1000,
+        )
 
     def _fetch_optional_buses(self, city: str, routeids: list[str]) -> TDXJSONResponse | None:
         try:
@@ -1603,6 +1806,8 @@ class RealtimeService:
         static_route: dict[str, Any],
         items: list[dict[str, Any]],
         realtime_buses: list[dict[str, Any]] | None = None,
+        *,
+        update_plate_states: bool = True,
     ) -> dict[str, Any]:
         now_ts = int(time.time())
         item_times = []
@@ -1801,7 +2006,8 @@ class RealtimeService:
             "paths": response_paths,
         }
         _prune_expired_backfill(snapshot, now_ts=now_ts)
-        self._set_last_native_plate_states(routeid, merged_native_plate_states)
+        if update_plate_states:
+            self._set_last_native_plate_states(routeid, merged_native_plate_states)
         return snapshot
 
     def _get_cached(self, routeid: str, *, allow_expired: bool = False) -> dict[str, Any] | None:

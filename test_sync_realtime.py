@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, Mock, patch
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from app.api import routes
 from app.config import Settings
 from app.db import get_connection, init_db
 from app.sync_realtime import RealtimeService, RouteBusesService
@@ -224,6 +229,258 @@ class RealtimeBackfillTests(unittest.TestCase):
                     service.get_snapshot("TXG307")
                 self.assertEqual(service.get_batch_snapshots(["TXG307"]), {})
 
+    def test_prefer_cached_returns_before_slow_refresh_and_coalesces_it(self) -> None:
+        now = datetime.now().astimezone().isoformat()
+        self.client.eta_payload_by_route["TXG307"] = [{
+            "SubRouteUID": "TXG307", "Direction": 0, "StopID": "STOP1",
+            "EstimateTime": 120, "UpdateTime": now,
+        }]
+        service, _ = self._build_services()
+        service.get_snapshot("TXG307")
+        service._cache["TXG307"].expires_at = 0
+        self.client.eta_payload_by_route["TXG307"][0]["EstimateTime"] = 240
+
+        started = threading.Event()
+        release = threading.Event()
+        original = self.client.fetch_estimated_time_of_arrival_batch
+
+        def blocked_eta(*args, **kwargs):
+            started.set()
+            if not release.wait(3):
+                raise TimeoutError("test refresh was not released")
+            return original(*args, **kwargs)
+
+        with patch.object(self.client, "fetch_estimated_time_of_arrival_batch", side_effect=blocked_eta) as fetch, \
+             ThreadPoolExecutor(max_workers=1) as executor:
+            try:
+                preview = executor.submit(service.get_snapshot, "TXG307", prefer_cached=True)
+                self.assertTrue(preview.result(timeout=1)["stale"])
+                self.assertTrue(started.wait(1))
+                self.assertTrue(service.get_snapshot("TXG307", prefer_cached=True)["stale"])
+                self.assertEqual(fetch.call_count, 1)
+            finally:
+                release.set()
+
+            deadline = time.monotonic() + 3
+            while service._background_refreshing_cities and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(service._background_refreshing_cities)
+        self.assertGreater(service.get_snapshot("TXG307")["paths"][0]["stops"][0]["eta"], 220)
+
+    def test_prefer_cached_does_not_reuse_old_eta_source(self) -> None:
+        old_time = datetime.fromtimestamp(time.time() - 95).astimezone().isoformat()
+        self.client.eta_payload_by_route["TXG307"] = [{
+            "SubRouteUID": "TXG307", "Direction": 0, "StopID": "STOP1",
+            "EstimateTime": 120, "UpdateTime": old_time,
+        }]
+        service, _ = self._build_services()
+        service.get_snapshot("TXG307")
+        service._cache["TXG307"].expires_at = 0
+        self.client.eta_payload_by_route["TXG307"][0].update({
+            "EstimateTime": 240, "UpdateTime": datetime.now().astimezone().isoformat(),
+        })
+
+        with patch.object(self.client, "fetch_estimated_time_of_arrival_batch",
+                          wraps=self.client.fetch_estimated_time_of_arrival_batch) as fetch:
+            refreshed = service.get_snapshot("TXG307", prefer_cached=True)
+            try:
+                fetch.assert_called_once()
+                self.assertFalse(refreshed.get("stale", False))
+                self.assertGreater(refreshed["paths"][0]["stops"][0]["eta"], 220)
+            finally:
+                deadline = time.monotonic() + 3
+                while service._eta_first_loads and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertFalse(service._eta_first_loads)
+
+    def test_prefer_cached_does_not_extend_snapshot_lifetime(self) -> None:
+        now = datetime.now().astimezone().isoformat()
+        self.client.eta_payload_by_route["TXG307"] = [{
+            "SubRouteUID": "TXG307", "Direction": 0, "StopID": "STOP1",
+            "EstimateTime": 120, "UpdateTime": now,
+        }]
+        service, _ = self._build_services()
+        service.get_snapshot("TXG307")
+        service._cache["TXG307"].expires_at = 0
+        service._cache["TXG307"].fetched_at -= 91
+        with patch.object(self.client, "fetch_estimated_time_of_arrival_batch",
+                          wraps=self.client.fetch_estimated_time_of_arrival_batch) as fetch:
+            refreshed = service.get_snapshot("TXG307", prefer_cached=True)
+            try:
+                fetch.assert_called_once()
+                self.assertFalse(refreshed.get("stale", False))
+            finally:
+                deadline = time.monotonic() + 3
+                while service._eta_first_loads and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertFalse(service._eta_first_loads)
+
+    def test_cold_route_returns_eta_before_deferred_travel_time_write(self) -> None:
+        now = datetime.now().astimezone().isoformat()
+        self.client.eta_payload_by_route["TXG307"] = [
+            {
+                "SubRouteUID": "TXG307", "Direction": 0, "StopID": stopid,
+                "EstimateTime": eta, "UpdateTime": now, "PlateNumb": "ABC-1234",
+            }
+            for stopid, eta in (("STOP1", 120), ("STOP2", 180))
+        ]
+        service, _ = self._build_services()
+        scheduled: list = []
+
+        snapshot = service.get_snapshot(
+            "TXG307",
+            schedule_travel_time_update=scheduled.append,
+        )
+        self.assertEqual(snapshot["paths"][0]["stops"][0]["eta"], 120)
+        self.assertEqual(len(scheduled), 1)
+        with get_connection(self.db_path) as connection:
+            before = connection.execute(
+                "SELECT sample_count FROM stop_travel_times WHERE routeid = ? "
+                "AND from_seq = 1 AND to_seq = 2 AND source = 'eta'",
+                ("TXG307",),
+            ).fetchone()["sample_count"]
+        self.assertEqual(before, 4)
+
+        scheduled[0]()
+        with get_connection(self.db_path) as connection:
+            after = connection.execute(
+                "SELECT sample_count FROM stop_travel_times WHERE routeid = ? "
+                "AND from_seq = 1 AND to_seq = 2 AND source = 'eta'",
+                ("TXG307",),
+            ).fetchone()["sample_count"]
+        self.assertEqual(after, 5)
+
+    def test_cold_native_eta_precedes_slow_vehicle_fetch_without_duplicate_eta_calls(self) -> None:
+        now = datetime.now().astimezone().isoformat()
+        self.client.eta_payload_by_route["TXG307"] = [
+            {
+                "SubRouteUID": "TXG307", "Direction": 0, "StopID": stopid,
+                "EstimateTime": eta, "UpdateTime": now, "PlateNumb": "ABC-1234",
+            }
+            for stopid, eta in (("STOP1", 120), ("STOP2", 180))
+        ]
+        self.client.buses_payload_by_route["TXG307"] = [{
+            "SubRouteUID": "TXG307", "PlateNumb": "ABC-1234", "Direction": 0,
+            "BusPosition": {"PositionLat": 24.1, "PositionLon": 120.65},
+        }]
+        service, buses_service = self._build_services()
+        started = threading.Event()
+        release = threading.Event()
+        original = self.client.fetch_realtime_by_frequency_batch
+
+        def blocked_buses(*args, **kwargs):
+            started.set()
+            if not release.wait(3):
+                raise TimeoutError("test bus source was not released")
+            return original(*args, **kwargs)
+
+        with patch.object(self.client, "fetch_realtime_by_frequency_batch", side_effect=blocked_buses), \
+             patch.object(self.client, "fetch_estimated_time_of_arrival_batch",
+                          wraps=self.client.fetch_estimated_time_of_arrival_batch) as fetch_eta, \
+             ThreadPoolExecutor(max_workers=2) as executor:
+            try:
+                early = executor.submit(service.get_snapshot, "TXG307", prefer_cached=True)
+                preview = early.result(timeout=1)
+                self.assertTrue(preview["partial"])
+                self.assertEqual(preview["paths"][0]["stops"][0]["eta"], 120)
+                self.assertTrue(started.wait(1))
+                self.assertEqual(service.get_snapshot("TXG307", prefer_cached=True), preview)
+                self.assertEqual(fetch_eta.call_count, 1)
+                self.assertNotIn("TXG307", buses_service._cache)
+                self.assertNotIn("TXG307", service._last_native_plate_states)
+                with get_connection(self.db_path) as connection:
+                    count = connection.execute(
+                        "SELECT sample_count FROM stop_travel_times WHERE routeid = ? "
+                        "AND from_seq = 1 AND to_seq = 2 AND source = 'eta'",
+                        ("TXG307",),
+                    ).fetchone()["sample_count"]
+                self.assertEqual(count, 4)
+            finally:
+                release.set()
+
+            deadline = time.monotonic() + 3
+            while service._eta_first_loads and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(service._eta_first_loads)
+
+        final = service.get_snapshot("TXG307")
+        self.assertNotIn("partial", final)
+        self.assertIn("TXG307", buses_service._cache)
+        self.assertIn("TXG307", service._last_native_plate_states)
+        with get_connection(self.db_path) as connection:
+            count = connection.execute(
+                "SELECT sample_count FROM stop_travel_times WHERE routeid = ? "
+                "AND from_seq = 1 AND to_seq = 2 AND source = 'eta'",
+                ("TXG307",),
+            ).fetchone()["sample_count"]
+        self.assertEqual(count, 5)
+
+    def test_eta_first_failure_before_eta_is_retryable(self) -> None:
+        service, _ = self._build_services()
+        with patch.object(self.client, "fetch_estimated_time_of_arrival_batch",
+                          side_effect=RuntimeError("upstream offline")):
+            with self.assertRaisesRegex(RuntimeError, "upstream offline"):
+                service.get_snapshot("TXG307", prefer_cached=True)
+
+        self.client.eta_payload_by_route["TXG307"] = [{
+            "SubRouteUID": "TXG307", "Direction": 0, "StopID": "STOP1",
+            "EstimateTime": 120, "UpdateTime": datetime.now().astimezone().isoformat(),
+        }]
+        retried = service.get_snapshot("TXG307", prefer_cached=True)
+        self.assertEqual(retried["paths"][0]["stops"][0]["eta"], 120)
+        deadline = time.monotonic() + 3
+        while service._eta_first_loads and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(service._eta_first_loads)
+
+    def test_eta_first_waits_when_source_timestamp_is_missing(self) -> None:
+        self.client.eta_payload_by_route["TXG307"] = [{
+            "SubRouteUID": "TXG307", "Direction": 0, "StopID": "STOP1",
+            "EstimateTime": 120,
+        }]
+        service, _ = self._build_services()
+        result = service.get_snapshot("TXG307", prefer_cached=True)
+        self.assertNotIn("partial", result)
+        self.assertEqual(result["paths"][0]["stops"][0]["eta"], 120)
+
+    def test_failed_background_refresh_keeps_original_source_lifetime(self) -> None:
+        now = datetime.now().astimezone().isoformat()
+        self.client.eta_payload_by_route["TXG307"] = [{
+            "SubRouteUID": "TXG307", "Direction": 0, "StopID": "STOP1",
+            "EstimateTime": 120, "UpdateTime": now,
+        }]
+        service, _ = self._build_services()
+        service.get_snapshot("TXG307")
+        original_fetched_at = service._cache["TXG307"].fetched_at
+        service._cache["TXG307"].expires_at = 0
+
+        with patch.object(self.client, "fetch_estimated_time_of_arrival_batch",
+                          side_effect=RuntimeError("offline")) as fetch:
+            self.assertTrue(service.get_snapshot("TXG307", prefer_cached=True)["stale"])
+            deadline = time.monotonic() + 3
+            while service._background_refreshing_cities and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(service._background_refreshing_cities)
+            fetch.assert_called_once()
+            self.assertEqual(service._cache["TXG307"].fetched_at, original_fetched_at)
+            service._cache["TXG307"].fetched_at -= 91
+            with self.assertRaises(RuntimeError):
+                service.get_snapshot("TXG307", prefer_cached=True)
+
+    def test_only_opted_in_route_realtime_requests_prefer_cached_data(self) -> None:
+        app = FastAPI()
+        service = Mock()
+        service.get_snapshot.return_value = {"paths": []}
+        app.state.realtime_service = service
+        app.include_router(routes.router)
+        with TestClient(app) as client:
+            self.assertEqual(client.get("/api/v1/routes/TXG307/realtime").status_code, 200)
+            service.get_snapshot.assert_called_with("TXG307")
+            self.assertEqual(client.get("/api/v1/routes/TXG307/realtime?prefer_cached=true").status_code, 200)
+            service.get_snapshot.assert_called_with(
+                "TXG307", prefer_cached=True, schedule_travel_time_update=ANY,
+            )
+
     def test_old_source_data_is_retained_and_flagged_stale(self) -> None:
         source_time = datetime.fromisoformat("2026-10-10T08:00:00+08:00").timestamp()
         self.client.eta_payload_by_route["TXG307"] = [{
@@ -355,6 +612,26 @@ class RealtimeBackfillTests(unittest.TestCase):
             ],
         )
         self.assertNotIn("STOP3", stops)
+
+    def test_eta_first_waits_for_vehicle_dependent_ntpc_fallback(self) -> None:
+        routeid = "NWT157491"
+        self._seed_route(routeid)
+        self.client.buses_payload_by_route[routeid] = [{
+            "RouteUID": routeid,
+            "SubRouteUID": routeid,
+            "Direction": 0,
+            "PlateNumb": "NTPC-ETA",
+            "BusPosition": {"PositionLat": 25.0, "PositionLon": 121.0},
+        }]
+        self.ntpc_client.eta_payload_by_route[routeid] = [{
+            "routeid": "16468", "stopid": "STOP2", "estimatetime": "45", "goback": "0",
+        }]
+        service, _ = self._build_services()
+
+        result = service.get_snapshot(routeid, prefer_cached=True)
+
+        self.assertNotIn("partial", result)
+        self.assertEqual(result["paths"][0]["stops"][0]["eta"], 45)
 
     def test_skips_ntpc_eta_fallback_when_tdx_has_no_realtime_buses(self) -> None:
         routeid = "NWT157491"

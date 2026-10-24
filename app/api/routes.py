@@ -10,7 +10,7 @@ import threading
 import time
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 
 from app.db import get_connection, load_database_version, load_path_points, load_route_static, path_exists, route_exists
@@ -474,9 +474,20 @@ def get_batch_routes_realtime(routeids: str, request: Request) -> dict:
 
 
 @router.get("/api/v1/routes/{routeid}/realtime")
-def get_route_realtime(routeid: str, request: Request) -> dict:
+def get_route_realtime(
+    routeid: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    prefer_cached: bool = Query(default=False),
+) -> dict:
     service = request.app.state.realtime_service
     try:
+        if prefer_cached:
+            return service.get_snapshot(
+                routeid,
+                prefer_cached=True,
+                schedule_travel_time_update=background_tasks.add_task,
+            )
         return service.get_snapshot(routeid)
     except RouteNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"Route {routeid} was not found.") from exc
