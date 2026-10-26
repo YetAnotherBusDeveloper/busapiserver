@@ -89,6 +89,13 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+既有環境也必須在啟動前更新依賴；只更新程式碼不會替換已安裝的原生解碼器。
+本專案要求 `Brotli >= 1.2.1`（CPython）或 `brotlicffi >= 1.2.1.0`（其他 Python
+實作），修補 [CVE-2026-111497 / HTTP2Shell](https://github.com/google/brotli/releases/tag/v1.2.1)。
+即使只用 Brotli 壓縮回應，`requests`／`urllib3` 仍可能自動解壓上游的 Brotli 回應。
+啟動時會檢查兩種已安裝的解碼器並拒絕舊版，包含 CPython 環境中額外安裝的
+`brotlicffi`；若出現版本錯誤，依錯誤訊息升級該套件後，重新啟動所有 API／背景程序。
+
 ### 設定環境變數
 
 至少需要 TDX 的 API 憑證。可寫入 shell 環境變數，或在專案根目錄建立 `.env`：
