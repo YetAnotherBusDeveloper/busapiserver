@@ -97,6 +97,18 @@ class StopPassbyApiTests(unittest.TestCase):
             "paths": [{"pathid": pathid, "name": "Outbound", "stops": stops}],
         }
 
+    def test_preserves_origin_departure_in_compact_stop_response(self) -> None:
+        self._seed_route("TPE0001", "307", [(0, 2, "SHARED", "Shared Stop")])
+        departure = {"scheduled_at": 1792980000, "observed_at": 1792980300,
+                     "status": "not_departed", "grace_seconds": 600,
+                     "next_scheduled_at": 1792981200}
+        self.service.snapshots = {"TPE0001": self._snapshot("TPE0001", 0, [
+            {"stopid": "SHARED", "eta": None, "departure": departure},
+        ])}
+        response = self.client.get("/api/v1/stops/SHARED/passby")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["routes"][0]["departure"], departure)
+
     def test_returns_only_target_stop_bucket_per_route(self) -> None:
         # Two routes both stop at SHARED; each also has unrelated stops that
         # must NOT appear in the response.

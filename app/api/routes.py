@@ -942,6 +942,7 @@ def _station_passby_payload(
                 "message": (stop_bucket or {}).get("message", ""),
                 "updated_at": (stop_bucket or {}).get("updated_at"),
                 "eta_reference_at": (stop_bucket or {}).get("eta_reference_at"),
+                "departure": (stop_bucket or {}).get("departure"),
                 "buses": (stop_bucket or {}).get("buses", []),
                 "etas": (stop_bucket or {}).get("etas", []),
             }
@@ -1105,6 +1106,7 @@ def get_stop_passby(
                 "message": (stop_bucket or {}).get("message", ""),
                 "updated_at": (stop_bucket or {}).get("updated_at"),
                 "eta_reference_at": (stop_bucket or {}).get("eta_reference_at"),
+                "departure": (stop_bucket or {}).get("departure"),
                 "buses": (stop_bucket or {}).get("buses", []),
                 "etas": (stop_bucket or {}).get("etas", []),
             }

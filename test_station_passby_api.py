@@ -115,6 +115,16 @@ class StationPassbyApiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_station_projection_keeps_origin_departure(self) -> None:
+        departure = {"scheduled_at": 1792980000, "observed_at": 1792980300,
+                     "status": "not_departed", "grace_seconds": 600}
+        self.service.snapshots["TPE0001"]["paths"][0]["stops"][0]["departure"] = departure
+        response = self.client.get("/api/v1/stations/TPE-STATION-1/passby?city=TPE")
+        self.assertEqual(response.status_code, 200)
+        arrivals = [route for side in response.json()["sides"] for route in side["routes"]]
+        route = next(route for route in arrivals if route["routeid"] == "TPE0001")
+        self.assertEqual(route["departure"], departure)
+
     def _seed_route(
         self,
         routeid: str,
