@@ -166,6 +166,14 @@ class Settings:
     # intentionally contains only metadata and an admin link, never the raw
     # user-submitted title/content, so malicious input cannot reach Discord.
     feedback_discord_webhook_url: str | None = None
+    # Where to report a city whose realtime ETA feed keeps coming back empty
+    # (TDX answered 200 [] for all of Kaohsiung for days in 2026-10 and only a
+    # user report caught it). Unset falls back to the feedback webhook so the
+    # alert reaches someone without extra setup.
+    realtime_alert_discord_webhook_url: str | None = None
+    # How long every ETA refresh for a city has to stay empty before alerting.
+    # 0 turns the alert off.
+    realtime_empty_alert_after_seconds: int = 900
     # Application database (auth, analytics, announcements, feedback, account
     # sync). Independent of the static route database so the weekly static sync
     # never touches it. When not provided, it defaults to "app.db" next to db_path.
@@ -284,6 +292,12 @@ class Settings:
             ),
             feedback_discord_webhook_url=(
                 os.getenv("FEEDBACK_DISCORD_WEBHOOK_URL", "").strip() or None
+            ),
+            realtime_alert_discord_webhook_url=(
+                os.getenv("REALTIME_ALERT_DISCORD_WEBHOOK_URL", "").strip() or None
+            ),
+            realtime_empty_alert_after_seconds=int(
+                os.getenv("REALTIME_EMPTY_ALERT_AFTER_SECONDS", "900")
             ),
             account_sync_max_favorites=int(
                 os.getenv("ACCOUNT_SYNC_MAX_FAVORITES", "25")

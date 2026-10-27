@@ -253,6 +253,39 @@ class RealtimeBackfillTests(unittest.TestCase):
         self.assertEqual(second["paths"], first["paths"])
         self.assertEqual(service._cache["TXG307"].fetched_at, source_time + 35)
 
+    def test_eta_refreshes_report_item_counts_to_the_empty_feed_monitor(self) -> None:
+        monitor = Mock()
+        service = RealtimeService(self.settings, self.client, empty_feed_monitor=monitor)
+
+        service.get_snapshot("TXG307")
+        monitor.record.assert_called_once_with("Taichung", ["TXG307"], 0)
+
+        # Rows that no longer map onto the route leave users just as blank.
+        monitor.reset_mock()
+        service._cache.clear()
+        self.client.eta_payload_by_route["TXG307"] = [{
+            "SubRouteUID": "TXG999", "Direction": 0, "StopID": "STOP1",
+            "EstimateTime": 120, "UpdateTime": datetime.now().astimezone().isoformat(),
+        }]
+        service.get_snapshot("TXG307")
+        monitor.record.assert_called_once_with("Taichung", ["TXG307"], 0)
+
+        monitor.reset_mock()
+        service._cache.clear()
+        self.client.eta_payload_by_route["TXG307"] = [{
+            "SubRouteUID": "TXG307", "Direction": 0, "StopID": "STOP1",
+            "EstimateTime": 120, "UpdateTime": datetime.now().astimezone().isoformat(),
+        }]
+        service.get_batch_snapshots(["TXG307"])
+        monitor.record.assert_called_once_with("Taichung", ["TXG307"], 1)
+
+        monitor.reset_mock()
+        service._cache["TXG307"].expires_at = 0
+        with patch.object(self.client, "fetch_estimated_time_of_arrival_batch",
+                          return_value=TDXJSONResponse(None, 304, None)):
+            service.get_snapshot("TXG307")
+        monitor.record.assert_not_called()
+
     def test_repeated_failures_cannot_extend_stale_snapshot_lifetime(self) -> None:
         service, _ = self._build_services()
         with patch("app.sync_realtime.time.time", return_value=1000):
