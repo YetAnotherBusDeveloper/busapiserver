@@ -173,45 +173,6 @@ class RealtimeBackfillTests(unittest.TestCase):
         )
         return realtime_service, route_buses_service
 
-    def test_departure_metadata_reaches_all_stops_and_live_eta_wins(self) -> None:
-        now = datetime.fromisoformat("2026-10-26T10:05:00+08:00").timestamp()
-        self.client.eta_payload_by_route["TXG307"] = [
-            {"SubRouteUID": "TXG307", "Direction": 0, "StopID": "STOP1",
-             "StopStatus": 1, "ScheduledTime": "10:00", "EstimateTime": 60,
-             "UpdateTime": "2026-10-26T10:05:00+08:00"},
-            {"SubRouteUID": "TXG307", "Direction": 0, "StopID": "STOP2",
-             "EstimateTime": 720, "UpdateTime": "2026-10-26T10:05:00+08:00"},
-        ]
-        service, _ = self._build_services()
-        with patch("app.sync_realtime.time.time", return_value=now):
-            snapshot = service.get_snapshot("TXG307")
-        stops = snapshot["paths"][0]["stops"]
-        self.assertEqual(len(stops), 3)
-        self.assertIsNone(stops[0]["eta"])
-        self.assertEqual(stops[0]["message"], "未發車 5分")
-        self.assertEqual(stops[0]["departure"]["scheduled_at"], now - 300)
-        self.assertEqual(stops[0]["departure"]["status"], "not_departed")
-        self.assertEqual(stops[1]["eta"], 720)
-        self.assertEqual(stops[2]["departure"], stops[0]["departure"])
-
-    def test_late_departure_restores_live_eta_after_grace(self) -> None:
-        service, _ = self._build_services()
-        static = service._load_static_route("TXG307")
-        now = datetime.fromisoformat("2026-10-26T10:10:00+08:00").timestamp()
-        with patch("app.sync_realtime.time.time", return_value=now):
-            pending = service._build_snapshot("TXG307", static, [
-                {"Direction": 0, "StopID": "STOP1", "StopStatus": 1,
-                 "ScheduledTime": "10:00", "UpdateTime": "2026-10-26T10:10:00+08:00"},
-            ], realtime_buses=[])
-            live = service._build_snapshot("TXG307", static, [
-                {"Direction": 0, "StopID": "STOP2", "EstimateTime": 420,
-                 "PlateNumb": "LATE-BUS", "UpdateTime": "2026-10-26T10:10:00+08:00"},
-            ], realtime_buses=[])
-        self.assertEqual(pending["paths"][0]["stops"][0]["departure"]["scheduled_at"], now - 600)
-        stop = next(stop for stop in live["paths"][0]["stops"] if stop["stopid"] == "STOP2")
-        self.assertEqual(stop["eta"], 420)
-        self.assertEqual(stop["etas"][0]["plate"], "LATE-BUS")
-
     def test_waiting_batch_requests_recheck_the_city_cache(self) -> None:
         service, _ = self._build_services()
         city_lock = threading.Lock()

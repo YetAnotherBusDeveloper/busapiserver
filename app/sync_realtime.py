@@ -26,7 +26,6 @@ from app.db import (
     save_tdx_fetch_state,
 )
 from app.logging_utils import get_logger, setup_logging, shutdown_logging
-from app.departure_status import DepartureTracker, apply_departure_message
 from app.ntpc_opendata import NtpcOpenDataClient
 from app.route_aliases import get_route_alias_index
 from app.request_budget import budget_lock, realtime_budget, remaining_seconds, request_budget
@@ -246,10 +245,6 @@ def _adjusted_eta(
     now_ts: int,
     fallback_update_time: str | None = None,
 ) -> int | None:
-    if _to_int_or_none(data.get("StopStatus")) == 1:
-        # Some feeds include a schedule-derived EstimateTime while explicitly
-        # reporting not departed. It must not count down into "arriving".
-        return None
     estimate_time = _to_int_or_none(data.get("EstimateTime"))
     if estimate_time is None:
         return None
@@ -1119,7 +1114,6 @@ class RealtimeService:
         self._background_refresh_lock = threading.Lock()
         self._eta_first_loads: dict[str, _EtaFirstLoad] = {}
         self._eta_first_lock = threading.Lock()
-        self._departures = DepartureTracker()
 
     @realtime_budget
     def get_snapshot(
@@ -1824,22 +1818,6 @@ class RealtimeService:
         updated_at = max(item_times) if item_times else int(time.time())
 
         paths = static_route["paths"]
-        def load_schedules() -> list[dict]:
-            with get_connection(self.settings.db_path) as connection:
-                rows = connection.execute(
-                    "SELECT direction, kind, service_days, payload FROM route_schedules WHERE routeid = ?",
-                    (routeid,),
-                ).fetchall()
-            return [dict(row, service_days=json.loads(row["service_days"]),
-                         payload=json.loads(row["payload"])) for row in rows]
-
-        departures = self._departures.update(
-            routeid, paths, items, now_ts=now_ts, load_schedules=load_schedules,
-        )
-        suspended_stops = {
-            (int(item.get("Direction") or 0), item.get("StopID") or item.get("StopUID"))
-            for item in items if _to_int_or_none(item.get("StopStatus")) in {2, 3, 4}
-        }
         grouped: dict[int, dict[str, dict[str, Any]]] = {}
         plate_candidates: dict[tuple[int, str], list[PlateObservation]] = {}
         current_native_plate_states: dict[tuple[int, str], LastNativePlateState] = {}
@@ -1989,20 +1967,12 @@ class RealtimeService:
         seen_pathids = set(paths)
         seen_pathids.update(grouped)
 
-        for pathid in departures:
-            path_bucket = grouped.setdefault(pathid, {})
-            for stop in paths[pathid].get("stops") or []:
-                path_bucket.setdefault(stop["stopid"], _create_stop_bucket(stop["stopid"]))
-
-        for pathid, path_bucket in grouped.items():
-            for stopid, stop_bucket in path_bucket.items():
+        for path_bucket in grouped.values():
+            for stop_bucket in path_bucket.values():
                 _finalize_stop_eta_list(stop_bucket)
                 # ETA has already been adjusted to now_ts. updated_at remains
                 # the source timestamp, used only to determine data freshness.
                 stop_bucket["eta_reference_at"] = now_ts
-                if pathid in departures and (pathid, stopid) not in suspended_stops:
-                    stop_bucket["departure"] = departures[pathid]
-                    apply_departure_message(stop_bucket, now_ts)
 
         for pathid in sorted(seen_pathids):
             path_meta = paths.get(pathid)
@@ -2055,7 +2025,6 @@ class RealtimeService:
         _prune_expired_backfill(snapshot, now_ts=int(now))
         for path in snapshot.get("paths", []):
             for stop in path.get("stops", []):
-                apply_departure_message(stop, int(now))
                 source_time = stop.get("updated_at") or snapshot.get("eta_reference_at")
                 if source_time is not None and now - source_time > REALTIME_MAX_AGE_SECONDS:
                     # Retain the last known ETA/buses instead of blanking them:
