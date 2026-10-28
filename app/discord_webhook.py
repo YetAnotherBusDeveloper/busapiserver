@@ -102,6 +102,73 @@ def notify_new_feedback(
     return _post_webhook(webhook_url, payload)
 
 
+_ALERT_COLOR = 0xED4245
+_RECOVERED_COLOR = 0x57F287
+
+
+def notify_realtime_feed(
+    settings: Settings,
+    *,
+    city: str,
+    empty_since: int,
+    route_count: int,
+    recovered_at: int | None = None,
+) -> bool:
+    """Report that a city's realtime ETA feed went empty, or came back.
+
+    ``recovered_at`` of None means the feed is still empty. Returns True if the
+    webhook was delivered; never raises.
+    """
+    webhook_url = settings.realtime_alert_discord_webhook_url or settings.feedback_discord_webhook_url
+    if not webhook_url:
+        return False
+
+    if recovered_at is None:
+        embed = {
+            "title": f"⚠️ Realtime feed empty: {city}",
+            "description": (
+                f"Every ETA refresh for {city} has produced no rows for any route since "
+                f"<t:{empty_since}:R>, so arrival times are blank for users. Query TDX "
+                "EstimatedTimeOfArrival for the city without a $filter: 0 items there means "
+                "the upstream feed is empty; otherwise our route filter or mapping no longer matches."
+            ),
+            "color": _ALERT_COLOR,
+            "fields": [
+                {"name": "City", "value": city, "inline": True},
+                {"name": "Empty since", "value": f"<t:{empty_since}:f>", "inline": True},
+                {"name": "Routes refreshed", "value": str(route_count), "inline": True},
+            ],
+            "timestamp": _iso8601(empty_since),
+        }
+    else:
+        embed = {
+            "title": f"✅ Realtime feed recovered: {city}",
+            "description": f"ETA data for {city} is back after {_format_duration(recovered_at - empty_since)}.",
+            "color": _RECOVERED_COLOR,
+            "fields": [
+                {"name": "City", "value": city, "inline": True},
+                {"name": "Empty since", "value": f"<t:{empty_since}:f>", "inline": True},
+                {"name": "Recovered", "value": f"<t:{recovered_at}:f>", "inline": True},
+            ],
+            "timestamp": _iso8601(recovered_at),
+        }
+
+    payload = {
+        "username": "YABus Monitor",
+        "embeds": [embed],
+        "allowed_mentions": {"parse": []},
+    }
+    return _post_webhook(webhook_url, payload)
+
+
+def _format_duration(seconds: int) -> str:
+    minutes = max(0, seconds) // 60
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
 def _iso8601(epoch_seconds: int) -> str:
     from datetime import datetime, timezone
 

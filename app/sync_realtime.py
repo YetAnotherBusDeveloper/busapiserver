@@ -27,6 +27,7 @@ from app.db import (
 )
 from app.logging_utils import get_logger, setup_logging, shutdown_logging
 from app.ntpc_opendata import NtpcOpenDataClient
+from app.realtime_health import EmptyRealtimeMonitor
 from app.route_aliases import get_route_alias_index
 from app.request_budget import budget_lock, realtime_budget, remaining_seconds, request_budget
 from app.tdx_auth import TDXTokenManager
@@ -1097,11 +1098,13 @@ class RealtimeService:
         client: TDXClient,
         route_buses_service: "RouteBusesService | None" = None,
         ntpc_opendata_client: NtpcOpenDataClient | None = None,
+        empty_feed_monitor: EmptyRealtimeMonitor | None = None,
     ) -> None:
         self.settings = settings
         self.client = client
         self.route_buses_service = route_buses_service
         self.ntpc_opendata_client = ntpc_opendata_client
+        self.empty_feed_monitor = empty_feed_monitor or EmptyRealtimeMonitor(settings)
         self._cache: dict[str, CacheEntry] = {}
         self._cache_lock = threading.Lock()
         self._last_native_plate_states: dict[str, dict[tuple[int, str], LastNativePlateState]] = {}
@@ -1520,6 +1523,9 @@ class RealtimeService:
             routeid = _tdx_item_to_local(city, item, settings=self.settings)
             if routeid in static_routes:
                 items_by_route[routeid].append(item)
+        self.empty_feed_monitor.record(
+            city, effective_routeids, sum(len(items) for items in items_by_route.values()),
+        )
 
         buses_by_route: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for item in (buses_response.payload if buses_response is not None else []) or []:
@@ -1613,6 +1619,11 @@ class RealtimeService:
             routeid = _tdx_item_to_local(city, item, settings=self.settings)
             if routeid in static_routes:
                 items_by_route[routeid].append(item)
+        # Count rows that landed on a route, not raw rows: TDX answering with
+        # rows we can no longer map leaves users just as blank as answering [].
+        self.empty_feed_monitor.record(
+            city, effective_routeids, sum(len(items) for items in items_by_route.values()),
+        )
 
         if on_eta_ready is not None and items_by_route.get(requested_routeid):
             try:
