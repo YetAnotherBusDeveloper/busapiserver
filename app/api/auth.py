@@ -366,6 +366,13 @@ def _oauth_callback(
             status_code=302,
         )
 
+    mcp_provider = getattr(request.app.state, "mcp_provider", None)
+    if mcp_provider is not None:
+        from app.mcp_auth import finish_login
+
+        mcp_response = finish_login(mcp_provider, request, result)
+        if mcp_response is not None:
+            return mcp_response
     return _oauth_success_redirect(result)
 
 

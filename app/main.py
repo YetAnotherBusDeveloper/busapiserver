@@ -255,7 +255,8 @@ async def lifespan(app: FastAPI):
     scheduler_thread.start()
 
     try:
-        yield
+        async with mcp_lifespan():
+            yield
     finally:
         scheduler_stop_event.set()
         await asyncio.to_thread(analytics_writer.close)
@@ -371,3 +372,9 @@ app.include_router(metro_router)
 app.include_router(rail_router)
 app.include_router(bike_router)
 app.include_router(journeys_router)
+
+# Keep this last: the MCP ASGI app handles its protocol and OAuth routes after
+# FastAPI has matched the existing REST API and web pages.
+from app.mcp_server import install_mcp
+
+mcp_lifespan = install_mcp(app, settings)

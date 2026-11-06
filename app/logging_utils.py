@@ -13,6 +13,16 @@ _SETUP_LOCK = threading.Lock()
 _CONFIGURED_LOG_DIR: Path | None = None
 
 
+class OAuthAccessLogFilter(logging.Filter):
+    """Remove OAuth codes/state from Uvicorn's request-target access logs."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple) and len(record.args) == 5:
+            client, method, target, version, status = record.args
+            if isinstance(target, str) and target.split("?", 1)[0].startswith(("/oauth/", "/authorize", "/api/v1/auth/")):
+                record.args = (client, method, target.split("?", 1)[0], version, status)
+        return True
+
+
 def _cleanup_old_logs(log_dir: Path, *, retention_days: int = LOG_RETENTION_DAYS) -> None:
     cutoff = time.time() - (retention_days * 86400)
     for path in log_dir.glob("*.log*"):
@@ -33,6 +43,9 @@ def setup_logging(project_dir: str | Path) -> Path:
     _cleanup_old_logs(log_dir)
 
     with _SETUP_LOCK:
+        access_logger = logging.getLogger("uvicorn.access")
+        if not any(isinstance(item, OAuthAccessLogFilter) for item in access_logger.filters):
+            access_logger.addFilter(OAuthAccessLogFilter())
         app_logger = logging.getLogger(LOGGER_ROOT_NAME)
         if _CONFIGURED_LOG_DIR == log_dir and app_logger.handlers:
             return log_dir
