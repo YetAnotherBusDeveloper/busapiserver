@@ -312,7 +312,8 @@ def register_tools(server: FastMCP, api_app, *, private: bool):
                     key = (item["provider"], item["stationId"])
                     if key not in cache:
                         cache[key] = await get_station_arrivals(
-                            item["provider"], item["stationId"]
+                            "INT" if item["provider"] == "inter" else item["provider"],
+                            item["stationId"],
                         )
                     result["arrivals"] = cache[key]
                 elif item.get("routeId"):
@@ -325,7 +326,20 @@ def register_tools(server: FastMCP, api_app, *, private: bool):
                         stop = routes._find_snapshot_stop(
                             snapshot["data"], item.get("pathId", 0), str(raw_stop_id)
                         )
-                        result["arrivals"] = envelope(stop) if stop else None
+                        if stop:
+                            filtered = {
+                                key: value
+                                for key, value in snapshot["data"].items()
+                                if key != "paths"
+                            }
+                            filtered["paths"] = [
+                                {**path, "stops": [stop]}
+                                for path in snapshot["data"].get("paths", [])
+                                if path.get("pathid") == item.get("pathId", 0)
+                            ]
+                            result["arrivals"] = {**snapshot, "data": filtered}
+                        else:
+                            result["arrivals"] = None
                         if stop is None:
                             result["status"] = "stop_not_found"
                     else:

@@ -470,6 +470,62 @@ class MCPIntegrationTests(unittest.TestCase):
             401,
         )
 
+    def test_favorite_arrivals_preserve_source_time_and_map_intercity_provider(self):
+        from unittest.mock import patch
+
+        payload = {
+            "groups": {
+                "Trip": [
+                    {
+                        "type": "boarding",
+                        "provider": "tpe",
+                        "routeKey": 1,
+                        "pathId": 0,
+                        "stopId": 12,
+                        "routeId": "TPE307",
+                        "routeName": "307",
+                        "stopName": "Stop",
+                        "rawStopId": "S1",
+                    },
+                    {
+                        "type": "station",
+                        "provider": "inter",
+                        "stationId": "station-1",
+                        "stationName": "Terminal",
+                    },
+                ]
+            },
+            "groupKinds": {"Trip": "mixed"},
+        }
+        upsert_sync_document(
+            self.settings,
+            account_id=self.login.account_id,
+            namespace="favorites",
+            schema_version=2,
+            payload=payload,
+            client_modified_at="2026-11-06T00:01:00Z",
+            conflict_policy="client_wins",
+        )
+        client = self.register()
+        query, _, _ = self.consent(client)
+        token = self.exchange(client, query["code"][0]).json()["access_token"]
+        with patch(
+            "app.mcp_server.routes.get_station_passby",
+            return_value={"station_id": "station-1"},
+        ) as station:
+            result = self.rpc(
+                "/mcp",
+                "tools/call",
+                {"name": "get_favorite_arrivals", "arguments": {}},
+                token,
+            )
+        data = result.json()["result"]["structuredContent"]
+        self.assertEqual(data["items"][0]["arrivals"]["data"]["updated_at"], 123)
+        self.assertEqual(
+            data["items"][0]["arrivals"]["data"]["paths"][0]["stops"][0]["sec"], 180
+        )
+        self.assertEqual(station.call_args.kwargs["city"], "INT")
+
     def test_access_logs_remove_authorization_query_values(self):
         import logging
         from app.logging_utils import OAuthAccessLogFilter
