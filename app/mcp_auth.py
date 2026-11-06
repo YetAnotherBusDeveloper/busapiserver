@@ -372,6 +372,10 @@ class MCPAuthorizationProvider:
         return await self.load_access_token(token)
 
     async def load_refresh_token(self, client, refresh_token):
+        reused = self._load_token(refresh_token, "used_refresh")
+        if reused and reused["client_id"] == client.client_id:
+            self.revoke_grant(reused["grant_id"], reused["account_id"])
+            return None
         row = self._load_token(refresh_token, "refresh")
         if row is None or row["client_id"] != client.client_id:
             return None
@@ -396,11 +400,34 @@ class MCPAuthorizationProvider:
                 "SELECT client_id FROM mcp_grants WHERE id=?", (refresh_token.grant_id,)
             ).fetchone()
             if row is None or grant is None or grant[0] != client.client_id:
+                # A concurrent exchange can have rotated the token after load.
+                if (
+                    grant
+                    and grant[0] == client.client_id
+                    and db.execute(
+                        "SELECT 1 FROM mcp_tokens WHERE hash=? AND kind='used_refresh'",
+                        (digest(refresh_token.token),),
+                    ).fetchone()
+                ):
+                    db.execute(
+                        "UPDATE mcp_grants SET revoked_at=? WHERE id=?",
+                        (int(time.time()), refresh_token.grant_id),
+                    )
+                    db.commit()
                 raise TokenError("invalid_grant", "Invalid refresh token")
             if not set(scopes).issubset(json.loads(row["scopes"])):
                 raise TokenError("invalid_scope", "Scope cannot be expanded")
+            persistent_refresh = refresh_token.token
+            if client.token_endpoint_auth_method == "none":
+                # Public clients cannot authenticate a refresh request. Rotate
+                # their token and invalidate the family if a used token returns.
+                db.execute(
+                    "UPDATE mcp_tokens SET kind='used_refresh' WHERE hash=?",
+                    (digest(refresh_token.token),),
+                )
+                persistent_refresh = None
             tokens = self._issue_tokens(
-                db, refresh_token.grant_id, scopes, refresh_token.token
+                db, refresh_token.grant_id, scopes, persistent_refresh
             )
             db.commit()
         return tokens

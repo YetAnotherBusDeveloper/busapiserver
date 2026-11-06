@@ -65,8 +65,9 @@ Consent POSTs require a CSRF token and same-origin Origin header.
 
 Authorization codes expire after two minutes and are consumed atomically. Access
 tokens last at most one hour; refresh tokens have a 30-day inactivity limit and an
-absolute 90-day authorization lifetime. Refresh tokens remain stable for Google's
-persistent account-linking flow. Credentials are stored hashed in SQLite, including
+absolute 90-day authorization lifetime. Public clients receive rotating refresh
+tokens with reuse detection; authenticated confidential clients receive stable
+refresh tokens for Google's persistent account-linking flow. Credentials are stored hashed in SQLite, including
 client secrets. Revoking any token invalidates the complete authorization, including
 already-issued access tokens. Scopes cannot be expanded by refreshing.
 

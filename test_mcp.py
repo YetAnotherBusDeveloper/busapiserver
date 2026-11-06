@@ -242,10 +242,13 @@ class MCPIntegrationTests(unittest.TestCase):
             },
         )
         self.assertEqual(refreshed.status_code, 200)
-        self.assertEqual(refreshed.json()["refresh_token"], tokens["refresh_token"])
+        self.assertNotEqual(refreshed.json()["refresh_token"], tokens["refresh_token"])
         revoked = self.client.post(
             "/revoke",
-            data={"client_id": client["client_id"], "token": tokens["refresh_token"]},
+            data={
+                "client_id": client["client_id"],
+                "token": refreshed.json()["refresh_token"],
+            },
         )
         self.assertEqual(revoked.status_code, 200)
         self.assertEqual(
@@ -525,6 +528,40 @@ class MCPIntegrationTests(unittest.TestCase):
             data["items"][0]["arrivals"]["data"]["paths"][0]["stops"][0]["sec"], 180
         )
         self.assertEqual(station.call_args.kwargs["city"], "INT")
+
+    def test_public_refresh_rotation_detects_reuse(self):
+        client = self.register()
+        query, _, _ = self.consent(client)
+        tokens = self.exchange(client, query["code"][0]).json()
+        data = {
+            "client_id": client["client_id"],
+            "grant_type": "refresh_token",
+            "refresh_token": tokens["refresh_token"],
+        }
+        fresh = self.client.post("/token", data=data).json()
+        self.assertNotEqual(fresh["refresh_token"], tokens["refresh_token"])
+        self.assertEqual(self.client.post("/token", data=data).status_code, 400)
+        self.assertEqual(
+            self.rpc("/mcp", "tools/list", token=fresh["access_token"]).status_code, 401
+        )
+
+    def test_confidential_client_supports_persistent_linking(self):
+        client = self.register("client_secret_post")
+        query, _, _ = self.consent(client)
+        tokens = self.exchange(
+            client, query["code"][0], client_secret=client["client_secret"]
+        ).json()
+        response = self.client.post(
+            "/token",
+            data={
+                "client_id": client["client_id"],
+                "client_secret": client["client_secret"],
+                "grant_type": "refresh_token",
+                "refresh_token": tokens["refresh_token"],
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["refresh_token"], tokens["refresh_token"])
 
     def test_access_logs_remove_authorization_query_values(self):
         import logging
