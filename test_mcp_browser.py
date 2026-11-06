@@ -28,7 +28,10 @@ class MCPBrowserConsentTests(unittest.TestCase):
 
         cls.playwright = sync_playwright().start()
         cls.addClassCleanup(cls.playwright.stop)
-        options = {"headless": True}
+        # Use full Chromium's new headless mode, matching desktop Chrome. The
+        # separate headless-shell bypasses route interception on this redirect
+        # and attempts DNS for the deliberately non-existent callback domain.
+        options = {"headless": True, "channel": "chromium"}
         executable = os.getenv("MCP_TEST_BROWSER_EXECUTABLE")
         if executable:
             options["executable_path"] = executable
