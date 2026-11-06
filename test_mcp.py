@@ -290,6 +290,64 @@ class MCPIntegrationTests(unittest.TestCase):
         self.assertEqual(denial["error"], ["access_denied"])
         self.assertNotIn("code", denial)
 
+    def test_consent_form_preserves_origin_without_weakening_csrf(self):
+        client = self.register()
+        response = self.begin(client)
+        self.client.cookies.set("yabus_auth_token", self.login.token)
+        consent = self.client.get(response.headers["location"])
+        self.assertEqual(consent.headers["referrer-policy"], "strict-origin")
+        self.assertIn(
+            "form-action 'self' https://client.example;",
+            consent.headers["content-security-policy"],
+        )
+        pending_id = parse_qs(urlsplit(response.headers["location"]).query)[
+            "request_id"
+        ][0]
+        csrf = re.search("name='csrf' value='([^']+)'", consent.text)[1]
+        form = {"request_id": pending_id, "csrf": csrf, "decision": "approve"}
+        for headers in (
+            {},
+            {"Origin": "null"},
+            {"Origin": "https://evil.example"},
+            {"Origin": "https://client.example"},
+        ):
+            with self.subTest(headers=headers):
+                self.assertEqual(
+                    self.client.post(
+                        "/oauth/consent", data=form, headers=headers
+                    ).status_code,
+                    403,
+                )
+        for invalid in ("", "invalid-csrf"):
+            self.assertEqual(
+                self.client.post(
+                    "/oauth/consent",
+                    data={**form, "csrf": invalid},
+                    headers={"Origin": self.provider.issuer},
+                ).status_code,
+                403,
+            )
+        result = self.client.post(
+            "/oauth/consent", data=form, headers={"Origin": self.provider.issuer}
+        )
+        self.assertEqual(result.status_code, 303)
+        self.assertEqual(result.headers["referrer-policy"], "no-referrer")
+        manage = self.client.get("/oauth/connections")
+        self.assertEqual(manage.headers["referrer-policy"], "strict-origin")
+        self.assertIn("form-action 'self';", manage.headers["content-security-policy"])
+
+    def test_callback_origin_cannot_inject_csp_directives(self):
+        from app.mcp_auth import page
+
+        rendered = page(
+            "Consent",
+            "",
+            form_redirect_uri="https://client.example;script-src%20*/callback",
+        )
+        policy = rendered.headers["content-security-policy"]
+        self.assertNotIn(";script-src", policy)
+        self.assertNotIn(" *", policy)
+
     def test_secret_hashed_at_rest_and_basic_auth(self):
         client = self.register("client_secret_basic")
         with get_connection(self.settings.app_db_path) as db:
