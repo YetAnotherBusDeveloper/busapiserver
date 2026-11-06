@@ -14,7 +14,7 @@ import json
 import re
 import secrets
 import time
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -539,7 +539,16 @@ def browser_principal(provider, request):
     return authenticate_token(provider.settings, token) if token else None
 
 
-def page(title: str, body: str) -> HTMLResponse:
+def page(
+    title: str, body: str, *, form_redirect_uri: str | None = None
+) -> HTMLResponse:
+    form_sources = "'self'"
+    if form_redirect_uri is not None:
+        # Chromium also applies form-action to the redirect after a form POST.
+        # Allow only this transaction's registered callback origin. Quote CSP
+        # delimiters so even unusual registered URLs cannot add directives.
+        target = urlsplit(form_redirect_uri)
+        form_sources += " " + quote(f"{target.scheme}://{target.netloc}", safe=":/[]")
     return HTMLResponse(
         "<!doctype html><html lang='zh-Hant'><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -552,9 +561,12 @@ def page(title: str, body: str) -> HTMLResponse:
         f"</style><main><p>YABus · 帳號連接</p><h1>{html.escape(title)}</h1>{body}</main></html>",
         headers={
             "Cache-Control": "no-store",
-            "Referrer-Policy": "no-referrer",
+            # no-referrer makes native HTML form POSTs send Origin: null.
+            # Keep the same-origin CSRF check usable while omitting URL paths
+            # and query parameters from Referer (including OAuth request IDs).
+            "Referrer-Policy": "strict-origin",
             "X-Frame-Options": "DENY",
-            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+            "Content-Security-Policy": f"default-src 'none'; style-src 'unsafe-inline'; form-action {form_sources}; frame-ancestors 'none'; base-uri 'none'",
         },
     )
 
@@ -616,7 +628,9 @@ async def consent_page(provider, request):
         for name in ("google", "discord"):
             body += f"<a href='/oauth/login/{name}?{urlencode({'request_id': pending_id})}'>{name.title()}</a> "
         body += "</p>"
-        response = page("授權讀取收藏", body)
+        response = page(
+            "授權讀取收藏", body, form_redirect_uri=str(params.redirect_uri)
+        )
         cookie(response, request, CSRF_COOKIE, csrf)
         return response
     return page("連接你的收藏", body)

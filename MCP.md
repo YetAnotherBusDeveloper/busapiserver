@@ -62,6 +62,11 @@ Google/Discord sign-in completes on the existing server callback, with a browser
 state. The temporary application token is immediately revoked and replaced with a
 10-minute HttpOnly consent session. Application tokens are never sent to an AI client.
 Consent POSTs require a CSRF token and same-origin Origin header.
+Consent and authorization-management HTML uses `Referrer-Policy: strict-origin`
+so native browser form POSTs keep their Origin while omitting paths/query parameters
+from Referer. OAuth redirects retain `no-referrer`. Consent's `form-action` CSP
+permits only this server and the registered callback origin for that transaction;
+this lets browsers follow the POST redirect back to the AI client.
 
 Authorization codes expire after two minutes and are consumed atomically. Access
 tokens last at most one hour; refresh tokens have a 30-day inactivity limit and an
@@ -102,6 +107,20 @@ redirect/resource/scope rejection, CSRF, account isolation, token persistence,
 refresh, revocation and public/private separation without contacting an identity
 provider. Real provider login, platform directory submission and Android Gemini
 preview access still require the deployed service and platform account.
+
+Native Chromium form regressions additionally exercise approval, denial and
+revocation without injecting an Origin header. They use isolated browser storage,
+synthetic accounts and an in-process HTTP bridge; no identity provider is contacted.
+
+```powershell
+python -m pip install playwright
+python -m playwright install chromium
+$env:RUN_MCP_BROWSER_TESTS = "1"
+python -m pytest test_mcp_browser.py -q
+```
+
+`MCP_TEST_BROWSER_EXECUTABLE` can optionally select an existing Chromium executable.
+Without `RUN_MCP_BROWSER_TESTS=1`, these tests are skipped by the offline suite.
 
 For the existing offline suite, exclude the two live TDX probe scripts:
 

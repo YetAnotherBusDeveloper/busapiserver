@@ -1,0 +1,28 @@
+name: MCP browser consent
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  consent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -r requirements.txt pytest playwright
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+      - name: Exercise OAuth forms in Chromium and the API
+        env:
+          RUN_MCP_BROWSER_TESTS: '1'
+        run: python -m pytest test_mcp_browser.py test_mcp.py test_auth_api.py test_account_page.py -q
