@@ -18,6 +18,12 @@ Bus API Server 是一個以 FastAPI 打造的交通資訊後端，整合 [TDX �
 
 ## 功能特色
 
+### AI 助理與 MCP
+
+- `/mcp/public` 提供免登入的路線、站點、到站、班表與警示查詢。
+- `/mcp` 支援 OAuth 2.1／PKCE，讓 ChatGPT、Claude 與 Gemini Connected Apps 讀取使用者已同步的收藏。
+- 網頁帳號頁可管理與撤銷 AI 授權。部署、平台接入與測試見 [MCP.md](MCP.md)。
+
 ### 多模式交通資料
 
 - 公車即時到站、車輛位置、路線站序、路線線型、班表與假日資訊
