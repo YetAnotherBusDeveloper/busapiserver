@@ -391,6 +391,10 @@ CREATE TABLE IF NOT EXISTS feedbacks (
     browser_name    TEXT,
     browser_version TEXT,
     user_agent      TEXT NOT NULL,
+    category        TEXT,
+    route_context   TEXT,
+    contact         TEXT,
+    diagnostics_json TEXT,
     FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
 
@@ -545,6 +549,7 @@ def init_app_db(db_path: str | Path) -> None:
     with get_connection(db_path) as connection:
         connection.executescript(APP_SCHEMA_SQL)
         _migrate_account_devices_add_device_name(connection)
+        _migrate_feedback_optional_details(connection)
         connection.commit()
 
 
@@ -626,6 +631,16 @@ def migrate_app_tables_from_main(main_db_path: str | Path, app_db_path: str | Pa
         main_conn.commit()
 
     return migrated_any
+
+
+def _migrate_feedback_optional_details(connection: sqlite3.Connection) -> None:
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(feedbacks)").fetchall()
+    }
+    for name in ("category", "route_context", "contact", "diagnostics_json"):
+        if name not in columns:
+            connection.execute(f"ALTER TABLE feedbacks ADD COLUMN {name} TEXT")
 
 
 def _migrate_account_devices_add_device_name(connection: sqlite3.Connection) -> None:

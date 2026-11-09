@@ -206,6 +206,8 @@
       align-items: center;
       gap: 8px;
       color: var(--md-sys-color-outline);
+      overflow-wrap: anywhere;
+      min-width: 0;
     }
 
     .detail-row md-icon {
@@ -435,12 +437,45 @@
           entry.system_name,
           entry.browser_name,
           entry.user_agent,
+          categoryLabel(entry.category),
+          entry.route_context,
+          entry.contact,
+          entry.diagnostics ? Object.values(entry.diagnostics).join(" ") : "",
         ]
           .filter(Boolean)
           .join("\n")
           .toLowerCase();
         return haystack.includes(keyword);
       });
+    }
+
+    function categoryLabel(category) {
+      return ({ bug: "問題回報", data: "交通資料錯誤", feature: "功能建議", other: "其他" })[category] || "";
+    }
+
+    function renderOptionalDetails(entry) {
+      const details = [
+        ["回饋類型", categoryLabel(entry.category)],
+        ["相關路線／站牌", entry.route_context],
+        ["聯絡方式", entry.contact],
+      ].filter(([, value]) => value);
+      const rows = details.map(([label, value]) =>
+        `<div class="detail-row"><span>${escapeHtml(label)}: ${escapeHtml(value)}</span></div>`
+      ).join("");
+      const d = entry.diagnostics;
+      if (!d) return rows;
+      const diagnostics = [
+        ["App 版本", `${d.app_version}+${d.build_number}`],
+        ["程式版本", d.commit_hash],
+        ["平台", d.platform],
+        ["語言", d.locale],
+        ["畫面尺寸（邏輯像素）", `${d.screen_width} × ${d.screen_height}`],
+        ["文字縮放（以 14pt 為基準）", d.text_scale],
+        ["顯示主題", d.brightness === "dark" ? "深色" : "淺色"],
+      ];
+      return rows + `<details><summary>用戶主動附上的 App 與顯示資訊</summary>${diagnostics.map(([label, value]) =>
+        `<div class="detail-row"><span>${escapeHtml(label)}: ${escapeHtml(String(value))}</span></div>`
+      ).join("")}</details>`;
     }
 
     function renderFeedbacks() {
@@ -469,6 +504,7 @@
           </div>
           
           <div class="feedback-details">
+            ${renderOptionalDetails(entry)}
             <div class="detail-row">
               <md-icon>account_circle</md-icon>
               <span>帳號 ID: <span class="mono">${escapeHtml(entry.account_id)}</span></span>

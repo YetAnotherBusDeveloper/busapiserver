@@ -485,6 +485,42 @@ TDX 可能整個縣市都回 `200 []`，但不會出錯（2026-10 高雄就這�
 | GET | `/api/v1/admin/feedbacks` | 意見回饋清單（admin） |
 | GET | `/admin/feedbacks` | 意見回饋管理後台頁面 |
 
+提交需要登入，每個帳號每分鐘限一次。必填 `title`（1–100 字）與 `content`（1–4000 字）。以下欄位皆可省略或傳入 `null`，舊版 App 的請求仍相容：
+
+| 選填欄位 | 格式 |
+| --- | --- |
+| `category` | `bug`、`data`、`feature` 或 `other` |
+| `route_context` | 相關地區、路線、方向或站牌，最多 200 字；空白視為未提供 |
+| `contact` | 用戶自行填寫的聯絡方式，最多 200 字；空白視為未提供 |
+| `diagnostics` | 用戶主動選擇附上的 App 與顯示資訊，格式如下；省略時不自動建立 |
+
+```json
+{
+  "title": "到站資訊有誤",
+  "content": "307 公車到站後仍顯示 5 分鐘。",
+  "category": "data",
+  "route_context": "臺北市 307，往板橋，臺北車站",
+  "contact": "rider@example.test",
+  "diagnostics": {
+    "app_version": "1.2.3",
+    "build_number": "45",
+    "commit_hash": "abcdef0",
+    "platform": "android",
+    "locale": "zh-TW",
+    "screen_width": 390,
+    "screen_height": 844,
+    "text_scale": 1.2,
+    "brightness": "dark"
+  }
+}
+```
+
+提供 `diagnostics` 時，上例的九個欄位皆必填，且不接受額外欄位。`app_version`、`build_number`、`commit_hash`、`locale` 分別最多 100、40、64、35 字；`platform` 為 `android`、`ios`、`macos`、`windows`、`linux`、`fuchsia` 或 `web`。畫面寬高使用邏輯像素的正整數（上限 100000）；`text_scale` 是以 14pt 文字計算的縮放比例（大於 0、最多 10）；`brightness` 為 `light` 或 `dark`。
+
+管理員清單回傳上述欄位，管理後台可顯示、搜尋補充資訊。原有的請求 User-Agent 與帳號資訊仍依既有流程記錄；選填資訊僅儲存於應用資料庫，Discord 通知維持只包含中繼資料。
+
+部署時先更新後端，再發布新版 App。啟動時 `init_app_db()` 會自動補上可空的欄位，保留歷史資料；舊回饋的新增欄位回傳 `null`。尚未更新的後端會拒絕新增欄位。
+
 </details>
 
 <details>

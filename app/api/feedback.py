@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import time
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, RedirectResponse
@@ -24,11 +25,36 @@ _FEEDBACK_LIMIT_WINDOW_SECONDS = 60
 _FEEDBACK_LIMIT_DETAIL = "Feedback submissions are limited to 1 per minute."
 
 
+class FeedbackDiagnostics(BaseModel):
+    """Explicitly shared app/display context; arbitrary logs are not accepted."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    app_version: str = Field(min_length=1, max_length=100)
+    build_number: str = Field(min_length=1, max_length=40)
+    commit_hash: str = Field(min_length=1, max_length=64)
+    platform: Literal["android", "ios", "macos", "windows", "linux", "fuchsia", "web"]
+    locale: str = Field(min_length=1, max_length=35)
+    screen_width: int = Field(gt=0, le=100000, strict=True)
+    screen_height: int = Field(gt=0, le=100000, strict=True)
+    text_scale: float = Field(gt=0, le=10, allow_inf_nan=False)
+    brightness: Literal["light", "dark"]
+
+
 class FeedbackCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     title: str = Field(min_length=1, max_length=100)
     content: str = Field(min_length=1, max_length=4000)
+    category: Literal["bug", "data", "feature", "other"] | None = None
+    route_context: str | None = Field(default=None, max_length=200)
+    contact: str | None = Field(default=None, max_length=200)
+    diagnostics: FeedbackDiagnostics | None = None
+
+    @field_validator("route_context", "contact", mode="before")
+    @classmethod
+    def _strip_optional_text(cls, value: Any) -> Any:
+        return (value.strip() or None) if isinstance(value, str) else value
 
     @field_validator("title", "content")
     @classmethod
@@ -85,9 +111,13 @@ def create_feedback(request: Request, payload: FeedbackCreateRequest) -> dict[st
                 app_commit_hash,
                 browser_name,
                 browser_version,
-                user_agent
+                user_agent,
+                category,
+                route_context,
+                contact,
+                diagnostics_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 feedback_id,
@@ -104,6 +134,10 @@ def create_feedback(request: Request, payload: FeedbackCreateRequest) -> dict[st
                 parsed_user_agent.browser_name,
                 parsed_user_agent.browser_version,
                 safe_user_agent,
+                payload.category,
+                payload.route_context,
+                payload.contact,
+                payload.diagnostics.model_dump_json() if payload.diagnostics else None,
             ),
         )
         connection.commit()
@@ -171,6 +205,10 @@ def list_feedbacks(
                 f.browser_name,
                 f.browser_version,
                 f.user_agent,
+                f.category,
+                f.route_context,
+                f.contact,
+                f.diagnostics_json,
                 (
                     SELECT COALESCE(
                         NULLIF(i.display_name, ''),
@@ -243,6 +281,10 @@ def _row_to_feedback(row) -> dict[str, Any]:
         "browser_name": row["browser_name"],
         "browser_version": row["browser_version"],
         "user_agent": row["user_agent"],
+        "category": row["category"],
+        "route_context": row["route_context"],
+        "contact": row["contact"],
+        "diagnostics": json.loads(row["diagnostics_json"]) if row["diagnostics_json"] else None,
     }
 
 
