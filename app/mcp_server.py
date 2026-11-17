@@ -13,13 +13,13 @@ from fastapi import BackgroundTasks, HTTPException, Response
 from mcp.server.auth.handlers.metadata import MetadataHandler
 from mcp.server.auth.handlers.revoke import RevocationHandler
 from mcp.server.auth.handlers.token import TokenHandler
+from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.routes import build_metadata, cors_middleware, create_auth_routes
 from mcp.server.auth.settings import (
     AuthSettings,
     ClientRegistrationOptions,
     RevocationOptions,
 )
-from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
@@ -29,8 +29,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from app.api import routes
 from app.account_sync_service import get_sync_document, to_iso8601
+from app.api import routes
 from app.mcp_auth import (
     SCOPE,
     HashedClientAuthenticator,
@@ -39,7 +39,9 @@ from app.mcp_auth import (
     consent_page,
     consent_submit,
     login_start,
+    review_login,
 )
+from app.mcp_review import bootstrap_review_account
 from app.rate_limit import check_rate_limit
 
 INSTRUCTIONS = """YABus provides Taiwan public transit data and the user's cloud-synced favorites.
@@ -522,6 +524,9 @@ def install_mcp(api_app, settings):
     async def manage(request):
         return await connections(provider, request)
 
+    async def demo_login(request):
+        return await review_login(provider, request)
+
     async def http_error(request, exc):
         return JSONResponse(
             {"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers
@@ -532,6 +537,7 @@ def install_mcp(api_app, settings):
         [
             Route("/oauth/consent", consent, methods=["GET", "POST"]),
             Route("/oauth/login/{provider}", login),
+            Route("/oauth/review-login", demo_login, methods=["GET", "POST"]),
             Route("/oauth/connections", manage, methods=["GET", "POST"]),
         ]
     )
@@ -540,6 +546,7 @@ def install_mcp(api_app, settings):
     @asynccontextmanager
     async def lifespan():
         provider.initialize()
+        await asyncio.to_thread(bootstrap_review_account, settings)
         async with personal.session_manager.run(), public.session_manager.run():
             yield
 

@@ -163,6 +163,31 @@ class MCPBrowserConsentTests(unittest.TestCase):
             self.server.provider.account_grants(self.server.login.account_id), []
         )
 
+    def test_demo_password_login_and_consent_without_an_identity_provider(self):
+        from app.mcp_review import provision_review_account
+
+        password = "synthetic-native-browser-password"
+        demo_id = provision_review_account(
+            self.server.settings, "yabus-review", password
+        )
+        self.context.clear_cookies()
+        self.open_consent()
+        self.page.locator("a[href^='/oauth/review-login']").click()
+        self.page.locator("input[name=username]").fill("yabus-review")
+        self.page.locator("input[name=password]").fill(password)
+        self.page.locator("button[type=submit]").click()
+        self.assert_post("/oauth/review-login")
+        self.assertTrue(
+            any(c["name"] == "yabus_mcp_session" for c in self.context.cookies())
+        )
+        self.page.locator("button[value=approve]").click()
+        self.page.wait_for_url("https://client.example/callback*", timeout=5000)
+        self.assert_post("/oauth/consent")
+        self.assertEqual(len(self.server.provider.account_grants(demo_id)), 1)
+        self.assertEqual(
+            self.server.provider.account_grants(self.server.login.account_id), []
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

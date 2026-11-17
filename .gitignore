@@ -2,6 +2,8 @@ __pycache__/
 .venv/
 *.pyc
 .env
+mcp-review-bootstrap.json
+mcp-review-credentials.txt
 *.db
 *.db-shm
 *.db-wal

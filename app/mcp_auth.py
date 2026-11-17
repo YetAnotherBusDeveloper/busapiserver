@@ -6,6 +6,7 @@ This module owns consent, account binding and atomic credential lifecycle.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -40,6 +41,14 @@ from app.auth_service import (
 )
 from app.config import Settings
 from app.db import get_connection
+from app.mcp_review import (
+    SCHEMA as REVIEW_SCHEMA,
+)
+from app.mcp_review import (
+    active_review_account,
+    create_review_session,
+)
+from app.rate_limit import check_rate_limit
 
 SCOPE = "favorites:read"
 ACCESS_TTL = 3600
@@ -116,6 +125,7 @@ class MCPAuthorizationProvider:
     def initialize(self) -> None:
         with get_connection(self.settings.app_db_path) as db:
             db.executescript(SCHEMA)
+            db.executescript(REVIEW_SCHEMA)
             db.commit()
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
@@ -601,6 +611,12 @@ async def consent_page(provider, request):
     client = await provider.get_client(pending["client_id"])
     principal = browser_principal(provider, request)
     params = AuthorizationParams.model_validate_json(pending["params"])
+    review_account = active_review_account(provider.settings)
+    review_link = (
+        f"<a class='button' href='/oauth/review-login?{urlencode({'request_id': pending_id})}'>使用示範帳號登入</a>"
+        if review_account is not None
+        else ""
+    )
     body = f"<p><strong>{html.escape(client.client_name or 'MCP client')}</strong> 想要讀取你的 YABus 收藏與分類，並查詢收藏站牌的到站時間。</p>"
     body += f"<p>連接目的地：<small>{html.escape(urlsplit(str(params.redirect_uri)).netloc)}</small></p>"
     body += "<p>授權範圍：讀取已同步的收藏。有效期間最長 90 天，可隨時撤銷。</p>"
@@ -608,6 +624,7 @@ async def consent_page(provider, request):
         body += "<p>請先登入存有收藏的 YABus 帳號。</p>"
         for provider_name, label in (("google", "Google"), ("discord", "Discord")):
             body += f"<a class='button' href='/oauth/login/{provider_name}?{urlencode({'request_id': pending_id})}'>使用 {label} 登入</a>"
+        body += review_link
     else:
         csrf = secrets.token_urlsafe(32)
         with get_connection(provider.settings.app_db_path) as db:
@@ -618,7 +635,12 @@ async def consent_page(provider, request):
         label = (
             (identity["display_name"] or identity["email"])
             if identity
-            else str(principal.account_id)
+            else (
+                "YABus 示範帳號"
+                if review_account is not None
+                and review_account["account_id"] == principal.account_id
+                else str(principal.account_id)
+            )
         )
         body += f"<p>目前帳號：<strong>{html.escape(label or str(principal.account_id))}</strong></p>"
         body += f"<form method='post' action='/oauth/consent'><input type='hidden' name='request_id' value='{html.escape(pending_id)}'>"
@@ -628,12 +650,78 @@ async def consent_page(provider, request):
         for name in ("google", "discord"):
             body += f"<a href='/oauth/login/{name}?{urlencode({'request_id': pending_id})}'>{name.title()}</a> "
         body += "</p>"
+        body += review_link
         response = page(
             "授權讀取收藏", body, form_redirect_uri=str(params.redirect_uri)
         )
         cookie(response, request, CSRF_COOKIE, csrf)
         return response
     return page("連接你的收藏", body)
+
+
+async def review_login(provider, request):
+    if active_review_account(provider.settings) is None:
+        raise HTTPException(404, "Demo login is not enabled")
+    form = await request.form() if request.method == "POST" else None
+    pending_id = (
+        str(form.get("request_id", ""))
+        if form is not None
+        else request.query_params.get("request_id", "")
+    )
+    if pending_id:
+        provider.pending(pending_id)
+    error = ""
+    if form is not None:
+        verify_csrf(provider, request, form)
+        check_rate_limit(
+            request.client.host if request.client else "unknown",
+            "mcp:review-login",
+            requests=5,
+        )
+        check_rate_limit("all", "mcp:review-login-work", requests=30)
+        username, password = form.get("username"), form.get("password")
+        if not isinstance(username, str) or not isinstance(password, str):
+            raise HTTPException(400, "Invalid demo sign-in form")
+        if len(username) > 120 or len(password) > 256:
+            raise HTTPException(400, "Invalid demo sign-in form")
+        session = await asyncio.to_thread(
+            create_review_session, provider.settings, username, password
+        )
+        if session is not None:
+            previous = request.cookies.get(SESSION_COOKIE)
+            if previous:
+                with get_connection(provider.settings.app_db_path) as db:
+                    db.execute(
+                        "DELETE FROM mcp_login_sessions WHERE hash=?",
+                        (digest(previous),),
+                    )
+                    db.commit()
+            target = (
+                "/oauth/consent?" + urlencode({"request_id": pending_id})
+                if pending_id
+                else "/oauth/connections"
+            )
+            response = RedirectResponse(target, status_code=303)
+            cookie(response, request, SESSION_COOKIE, session)
+            return response
+        error = "<p role='alert'>示範帳號或密碼不正確。</p>"
+    csrf = secrets.token_urlsafe(32)
+    response = page(
+        "示範帳號登入",
+        "<p>此入口僅供使用範例收藏的獨立示範帳號。一般帳號請使用 Google 或 Discord 登入。</p>"
+        + error
+        + "<form method='post' action='/oauth/review-login'>"
+        + f"<input type='hidden' name='csrf' value='{csrf}'>"
+        + f"<input type='hidden' name='request_id' value='{html.escape(pending_id, quote=True)}'>"
+        + "<p><label>示範帳號 <input name='username' autocomplete='username' maxlength='120' required></label></p>"
+        + "<p><label>密碼 <input type='password' name='password' autocomplete='current-password' maxlength='256' required></label></p>"
+        + "<button type='submit'>登入示範帳號</button></form>"
+        + "<p>登入後，請回到 AI 用戶端連接 YABus，並確認讀取收藏的授權。</p>",
+    )
+    if error:
+        response.status_code = 401
+    cookie(response, request, CSRF_COOKIE, csrf)
+    return response
 
 
 async def consent_submit(provider, request):

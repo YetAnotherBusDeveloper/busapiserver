@@ -101,6 +101,79 @@ Suggested prompts: “找台北 307 的方向”, “查我的『上班』收藏
 
 ## Verification
 
+### Reviewer account without Google/Discord verification
+
+For review, use the optional, isolated YABus demo-password login. No account or
+login is enabled without operator provisioning or a private bootstrap file.
+
+#### Pterodactyl / hosts without a terminal
+
+Upload the supplied private `mcp-review-bootstrap.json` beside the server's
+`app/` directory, then restart after deploying the updated server code. The file
+contains a username, a salted password hash and `enabled: true`; it does not
+contain the plaintext password. The server creates the isolated sample account
+automatically. Store the separately supplied plaintext credentials in your
+password manager and in the submission portal's secure reviewer fields. Never
+upload those credentials as website content or include them in a public ZIP.
+
+Repeated starts with the same bootstrap file preserve the account, sample
+document, password and existing authorizations. A replacement file with a new
+password hash rotates access and revokes the previous sessions/authorizations.
+The file is excluded from Git. Removing it does not delete or disable an already
+provisioned account; to deliberately disable the login without a terminal, set
+its `enabled` value to `false` in the panel file manager and restart. Leave it
+enabled for ongoing review. Malformed bootstrap configuration prevents startup
+without logging its contents.
+
+If using the supplied server-update ZIP, extract it at the server root (the
+directory containing `app/`). This is a private deployment bundle, not the
+plugin ZIP for OpenAI. It includes the bootstrap file; no terminal or database
+editing is required. It does not include a plaintext password.
+
+#### Interactive terminal setup
+
+Alternatively, run this inside the server's Python environment, using its normal
+runtime configuration:
+
+```powershell
+python -m app.mcp_review setup --username yabus-review
+```
+
+Enter a unique 20–256 character password twice at the hidden prompts. The command
+creates a separate, ordinary-role account with no Google/Discord identities or
+application device tokens. It seeds the `送審示範` group with the Taipei 307 莒光
+boarding stops `臺北客運板橋前站(藝文)` and `新月橋`, and a separate `測試其他`
+route group. The password is stored only as a salted PBKDF2-SHA256 hash; the
+command never prints it or accepts it as a command argument. Run setup again to
+rotate the password, reset the sample document and revoke previous demo sessions
+and MCP authorizations. This command cannot bind credentials to an existing user.
+
+In the submission portal's secure reviewer fields, choose username/password and
+enter the dedicated demo credentials. The login URL is the server's public HTTPS
+origin plus `/oauth/review-login`; tenant/workspace is `N/A — isolated YABus demo
+account`. Reviewers can sign in there first, then connect YABus from the AI client.
+Alternatively, during connection, choose `使用示範帳號登入` on the YABus consent
+page. After sign-in they must still approve `favorites:read`. Sample favorites
+are ready to query; no registration, phone, email code or identity-provider login
+is needed. Keep these credentials out of source control and plugin ZIPs.
+
+This password grants only a ten-minute, HttpOnly consent session. It cannot be
+used for application APIs, changing favorites or accessing another account. The
+login form requires the normal same-origin CSRF check and limits attempts per
+client and globally. Demo provisioning/login is refused if its account gains a
+privileged role, a Google/Discord identity or an application device/session.
+
+Keep the demo login working for ongoing review. Without a bootstrap file, the
+terminal command below deliberately disables it and revokes all its sessions
+and MCP authorizations. If a bootstrap file is present, set `enabled` to `false`
+there as well so a later restart does not re-enable the account:
+
+```powershell
+python -m app.mcp_review disable
+```
+
+### Automated checks
+
 `python -m pytest test_mcp.py -q` uses temporary databases, fake transit data and
 synthetic account identities. It tests discovery, actual JSON-RPC requests, PKCE,
 redirect/resource/scope rejection, CSRF, account isolation, token persistence,
