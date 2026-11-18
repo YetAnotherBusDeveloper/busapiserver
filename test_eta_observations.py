@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -22,6 +23,7 @@ import test_admin_api as admin_fixture
 import test_sync_realtime as realtime_fixture
 from app.api import analytics as analytics_api
 from app.auth_service import OAuthIdentity, _upsert_login
+from app.config import Settings
 from app.db import get_connection, init_app_db, init_db
 from app.eta_observations import (
     EtaObservationCollector,
@@ -327,13 +329,60 @@ class CollectorTests(_TempCase):
             eta_observations_enabled=True, eta_observations_db_path=self.db,
             eta_observations_cities=("Taichung", "Tainan"), eta_observations_retention_days=7,
             eta_observations_max_bytes=123, eta_observations_min_free_bytes=456,
+            eta_observations_quarantine_max_bytes=789,
         )
         config = build_collector(settings).config
         self.assertEqual(
-            (config.cities, config.retention_seconds, config.max_bytes, config.min_free_bytes),
-            (frozenset({"Taichung", "Tainan"}), 7 * 86400, 123, 456),
+            (config.cities, config.retention_seconds, config.max_bytes, config.min_free_bytes,
+             config.quarantine_max_bytes),
+            (frozenset({"Taichung", "Tainan"}), 7 * 86400, 123, 456, 789),
         )
         self.assertFalse(self.db.exists())  # nothing is created until start()
+
+    def test_quarantine_budget_comes_from_the_environment(self) -> None:
+        for extra, expected in (({}, 1024**3), ({"ETA_OBSERVATIONS_QUARANTINE_MAX_BYTES": "5000"}, 5000)):
+            with patch.dict(os.environ, {"ETA_OBSERVATIONS_ENABLED": "true", **extra}, clear=True), patch(
+                "app.config.load_dotenv"
+            ):
+                settings = Settings.from_env()
+            self.assertEqual(build_collector(settings).config.quarantine_max_bytes, expected)
+
+    def test_status_names_the_worker_it_came_from(self) -> None:
+        status = self.collector().status()
+        self.assertEqual((status["worker_pid"], status["counters_scope"]), (os.getpid(), "single_worker"))
+
+    def test_each_worker_reports_only_its_own_counters(self) -> None:
+        script = (
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            "import test_eta_observations as t\n"
+            "from app.eta_observations import EtaObservationCollector, EtaObservationConfig\n"
+            "collector = EtaObservationCollector(EtaObservationConfig(\n"
+            "    db_path=Path(sys.argv[1]), cities=frozenset({'Taichung'}), min_free_bytes=0, flush_interval=0.02))\n"
+            "collector.start()\n"
+            "for i in range(int(sys.argv[3])):\n"
+            "    assert collector.submit('Taichung', sys.argv[2] + str(i), t.route_rows())\n"
+            "assert collector.close(60)\n"
+            "print(json.dumps(collector.status()))\n"
+        )
+        workers = [
+            subprocess.Popen(
+                [sys.executable, "-c", script, str(self.db), prefix, str(count)], cwd=REPO,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            for prefix, count in (("A", 3), ("B", 5))
+        ]
+        reports = []
+        for worker in workers:
+            stdout, stderr = worker.communicate(timeout=120)
+            self.assertEqual(worker.returncode, 0, stderr.decode(errors="replace")[-600:])
+            reports.append(json.loads(stdout.decode().strip().splitlines()[-1]))
+        pids = [report["worker_pid"] for report in reports]
+        self.assertEqual(len({os.getpid(), *pids}), 3)  # two workers, neither of them this process
+        # Both wrote to one file, yet each answer covers its own worker only.
+        self.assertEqual([report["snapshots_written"] for report in reports], [3, 5])
+        self.assertEqual([report["counters_scope"] for report in reports], ["single_worker"] * 2)
+        self.assertEqual(query(self.db, "SELECT COUNT(*) FROM eta_snapshots"), [(8,)])
 
     def test_writes_in_background_and_reports_counters(self) -> None:
         collector = self.collector()
@@ -563,10 +612,13 @@ class ErrorClassificationTests(_TempCase):
 
 
 class QuarantineTests(_TempCase):
-    def store(self) -> EtaObservationStore:
-        store = EtaObservationStore(self.config(), clock=lambda: T0)
+    def store(self, *, free_bytes=None, **overrides) -> EtaObservationStore:
+        store = EtaObservationStore(self.config(**overrides), clock=lambda: T0, free_bytes=free_bytes)
         self.addCleanup(store.close)
         return store
+
+    def copies(self) -> list[str]:
+        return sorted(entry.name for entry in self.dir.glob("*.corrupt-*"))
 
     def names(self) -> list[str]:
         return sorted(entry.name for entry in self.dir.iterdir())
@@ -653,6 +705,80 @@ class QuarantineTests(_TempCase):
         with patch.object(store, "_verify", return_value="unknown"):
             self.assertEqual(store.quarantine(), ("unknown", None))
         self.assertTrue(self.db.exists())
+
+    def test_copy_that_would_exceed_the_byte_budget_is_not_made(self) -> None:
+        garbage = b"this is not a sqlite database " * 200  # 6000 bytes
+        self.db.write_bytes(garbage)
+        kept = self.dir / "eta_observations.db.corrupt-1"
+        kept.write_bytes(b"x" * 3000)
+        Path(str(kept) + "-wal").write_bytes(b"x" * 1000)
+        store = self.store(quarantine_max_bytes=9_999)  # 4000 kept + 6000 to move is one byte too many
+        self.assertEqual((store.quarantined_copies(), store.quarantine_bytes()), (1, 4000))
+        before = self.copies()
+        self.assertEqual(store.quarantine(), ("copies_over_budget", None))
+        self.assertEqual(self.copies(), before)
+        self.assertEqual(self.db.read_bytes(), garbage)
+        roomy = self.store(quarantine_max_bytes=10_000)
+        self.assertEqual(roomy.quarantine()[0], "moved")
+        self.assertEqual((roomy.quarantined_copies(), roomy.quarantine_bytes()), (2, 10_000))
+        self.assertFalse(self.db.exists())
+
+    def test_budget_counts_the_wal_that_travels_with_the_database(self) -> None:
+        store = self.store()
+        store.write([self.prepared(route_rows(T0 + i * 30, stops=40), routeid=f"R{i}") for i in range(40)])
+        store.close()
+        writer = sqlite3.connect(self.db, isolation_level=None)
+        writer.execute("PRAGMA wal_autocheckpoint = 0")
+        writer.execute("CREATE TABLE only_in_wal(x)")
+        writer.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+        writer.close()
+        garbage = b"this is not a sqlite database " * 200
+        self.db.write_bytes(garbage)
+        wal = Path(str(self.db) + "-wal").stat().st_size
+        self.assertGreater(wal, 0)
+        # Room for the main file alone is not room for the copy.
+        tight = self.store(quarantine_max_bytes=len(garbage) + wal - 1)
+        self.assertEqual(tight.quarantine(), ("copies_over_budget", None))
+        self.assertEqual((self.db.read_bytes(), self.copies()), (garbage, []))
+        roomy = self.store()
+        self.assertEqual(roomy.quarantine()[0], "moved")
+        self.assertGreaterEqual(roomy.quarantine_bytes(), len(garbage) + wal)
+
+    def test_budget_of_zero_never_sets_a_database_aside(self) -> None:
+        garbage = b"this is not a sqlite database " * 200
+        self.db.write_bytes(garbage)
+        self.assertEqual(self.store(quarantine_max_bytes=0).quarantine(), ("copies_over_budget", None))
+        self.assertEqual((self.db.read_bytes(), self.copies()), (garbage, []))
+
+    def test_volume_below_its_reserve_blocks_the_move(self) -> None:
+        garbage = b"this is not a sqlite database " * 200
+        self.db.write_bytes(garbage)
+        free = [999]
+        store = self.store(min_free_bytes=1000, free_bytes=lambda _: free[0])
+        self.assertEqual(store.quarantine(), ("low_disk_space", None))
+        self.assertEqual((self.db.read_bytes(), self.copies()), (garbage, []))
+        free[0] = 1000
+        self.assertEqual(store.quarantine()[0], "moved")
+
+    def test_unreadable_free_space_blocks_the_move(self) -> None:
+        def unknown(_):
+            raise OSError("cannot stat the volume")
+
+        garbage = b"this is not a sqlite database " * 200
+        self.db.write_bytes(garbage)
+        store = self.store(min_free_bytes=1000, free_bytes=unknown)
+        self.assertEqual(store.quarantine(), ("low_disk_space", None))
+        self.assertEqual((self.db.read_bytes(), self.copies()), (garbage, []))
+
+    def test_only_copies_of_this_database_count(self) -> None:
+        store = self.store(db_path=self.dir / "eta[1].db")
+        for name, size in (
+            ("eta[1].db.corrupt-5", 10), ("eta[1].db.corrupt-5-wal", 5),
+            ("eta1.db.corrupt-5", 100),   # what an unescaped "[1]" would match instead
+            ("other.db.corrupt-5", 100), ("eta[1].db", 100),
+        ):
+            (self.dir / name).write_bytes(b"x" * size)
+        self.assertEqual((store.quarantined_copies(), store.quarantine_bytes()), (1, 15))
 
 
 class FailureHandlingTests(_TempCase):
@@ -758,6 +884,71 @@ class FailureHandlingTests(_TempCase):
         self.assertTrue(collector.close())
         self.assertEqual(len(list(self.dir.glob("*.corrupt-*"))), 6)
         self.assertTrue(self.db.exists())
+        status = collector.status()
+        self.assertEqual(
+            (status["quarantine_blocked"], status["quarantined_copies"], status["quarantine_bytes"]),
+            ("too_many_copies", 3, 6),
+        )
+
+    def test_no_room_for_another_copy_pauses_and_leaves_the_database(self) -> None:
+        garbage = b"this is not a sqlite database " * 200
+        self.db.write_bytes(garbage)
+        collector = self.collector(quarantine_max_bytes=len(garbage) - 1)
+        collector.start()
+        collector.submit("Taichung", "TXG307", route_rows())
+        self.assertTrue(wait_for(lambda: collector.status()["paused_reason"] == "corrupt"))
+        self.assertFalse(collector.submit("Taichung", "TXG307", route_rows(T0 + 30)))  # paused: nothing queued
+        self.assertTrue(collector.close())
+        status = collector.status()
+        self.assertEqual(
+            (status["state"], status["quarantine_blocked"], status["corruption_suspected"],
+             status["corruption_recoveries"], status["quarantined_copies"], status["quarantine_bytes"],
+             status["dropped_while_paused"]),
+            ("stopped", "copies_over_budget", 1, 0, 0, 0, 1),
+        )
+        self.assertEqual(self.db.read_bytes(), garbage)
+        self.assertFalse(list(self.dir.glob("*.corrupt-*")))
+
+    def test_space_gone_by_the_time_of_the_move_pauses_instead(self) -> None:
+        garbage = b"this is not a sqlite database " * 200
+        self.db.write_bytes(garbage)
+        free = [10_000]
+        collector = self.collector(min_free_bytes=1000, free_bytes=lambda _: free[0])
+        collector.start()
+        self.assertTrue(wait_for(lambda: collector.status()["free_bytes"] == 10_000))  # started with room
+        free[0] = 10
+        collector.submit("Taichung", "TXG307", route_rows())
+        self.assertTrue(wait_for(lambda: collector.status()["paused_reason"] == "corrupt"))
+        self.assertTrue(collector.close())
+        status = collector.status()
+        self.assertEqual((status["quarantine_blocked"], status["corruption_recoveries"]), ("low_disk_space", 0))
+        self.assertEqual(self.db.read_bytes(), garbage)
+        self.assertFalse(list(self.dir.glob("*.corrupt-*")))
+
+    def test_second_corruption_within_the_hour_pauses_without_another_copy(self) -> None:
+        self.db.write_bytes(b"this is not a sqlite database " * 200)
+        collector = self.collector()
+        collector.start()
+        src = [T0]
+
+        def recovered() -> bool:
+            src[0] += 30
+            collector.submit("Taichung", "TXG307", route_rows(src[0]))
+            return collector.status()["snapshots_written"] >= 1
+
+        self.assertTrue(wait_for(recovered, timeout=10))
+        self.assertTrue(wait_for(lambda: collector.status()["queued"] == 0))
+        with patch.object(
+            collector._store, "write", side_effect=_sqlite_error(11, "database disk image is malformed"),
+        ):
+            collector.submit("Taichung", "TXG307", route_rows(src[0] + 30))
+            self.assertTrue(wait_for(lambda: collector.status()["paused_reason"] == "corrupt"))
+        self.assertTrue(collector.close())
+        status = collector.status()
+        self.assertEqual(
+            (status["quarantine_blocked"], status["corruption_recoveries"], status["quarantined_copies"]),
+            ("too_soon", 1, 1),
+        )
 
 
 class ShutdownAndCrashTests(_TempCase):
@@ -901,6 +1092,16 @@ class StatusEndpointAuthTests(unittest.TestCase):
             connection.execute("UPDATE accounts SET role = 'user'")
             connection.commit()
         self.assertEqual(self.client.get(self.url, headers=headers).status_code, 403)
+
+    def test_live_answer_says_which_worker_it_is(self) -> None:
+        self.client.app.state.eta_observations = EtaObservationCollector(
+            EtaObservationConfig(db_path=Path(self.temp_dir.name) / "eta.db", cities=frozenset({"Taichung"}))
+        )
+        admin = self.token("the-admin", admin=True)
+        body = self.client.get(self.url, headers={"Authorization": f"Bearer {admin}"}).json()
+        self.assertEqual(
+            (body["enabled"], body["worker_pid"], body["counters_scope"]), (True, os.getpid(), "single_worker"),
+        )
 
     def test_route_is_registered_on_the_main_app_with_the_guard(self) -> None:
         from app.main import app as main_app
@@ -1082,9 +1283,14 @@ class StatusEndpointTests(unittest.TestCase):
                 )
                 status = analytics_api.get_eta_observation_status(self.request(collector))
         for key in ("enabled", "state", "queued", "dropped_queue_full", "write_failures", "snapshots_written",
-                    "last_error", "last_write_at", "disk_bytes", "free_bytes", "paused_reason"):
+                    "last_error", "last_write_at", "disk_bytes", "free_bytes", "paused_reason",
+                    "worker_pid", "counters_scope", "quarantine_max_bytes", "quarantined_copies",
+                    "quarantine_bytes", "quarantine_blocked"):
             self.assertIn(key, status)
         self.assertEqual((status["enabled"], status["state"]), (True, "stopped"))
+        self.assertEqual(
+            (status["worker_pid"], status["quarantined_copies"], status["quarantine_bytes"]), (os.getpid(), 0, 0),
+        )
 
 
 if __name__ == "__main__":

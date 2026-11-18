@@ -20,6 +20,7 @@ recorded on the row rather than assumed away:
 from __future__ import annotations
 
 import errno
+import glob
 import os
 import shutil
 import sqlite3
@@ -115,6 +116,10 @@ class EtaObservationConfig:
     max_bytes: int = 1024**3
     # Stop writing while the volume has less than this free, whoever used it.
     min_free_bytes: int = 2 * 1024**3
+    # Budget for every quarantined copy together, -wal and -shm included.
+    # Copies are never deleted here, so this is what bounds them. 0 means a
+    # damaged database is never set aside automatically.
+    quarantine_max_bytes: int = 1024**3
     queue_capacity: int = 256
     batch_size: int = 64
     flush_interval: float = 0.5
@@ -357,12 +362,23 @@ class EtaObservationStore:
                 connection.close()
         return "healthy" if rows == [("ok",)] else "corrupt"
 
-    def quarantined_copies(self) -> int:
+    # The next three only list a directory: safe from any thread.
+    def _quarantined_files(self) -> list[Path]:
         path = self.config.db_path
-        return sum(
-            1 for entry in path.parent.glob(f"{path.name}.corrupt-*")
-            if not entry.name.endswith(("-wal", "-shm"))
-        )
+        return list(path.parent.glob(f"{glob.escape(path.name)}.corrupt-*"))
+
+    def quarantined_copies(self) -> int:
+        return sum(1 for entry in self._quarantined_files() if not entry.name.endswith(("-wal", "-shm")))
+
+    def quarantine_bytes(self) -> int:
+        """Bytes held by every quarantined copy, ``-wal``/``-shm`` included."""
+        total = 0
+        for entry in self._quarantined_files():
+            try:
+                total += entry.stat().st_size
+            except FileNotFoundError:
+                pass  # removed by an operator since it was listed
+        return total
 
     def quarantine(self) -> tuple[str, Path | None]:
         """Set a damaged database aside, if it really is damaged and nobody else has it open.
@@ -370,8 +386,12 @@ class EtaObservationStore:
         Returns ``("moved", copy)`` or, with the file left exactly where it
         was, ``("in_use", None)`` (another store still has it open),
         ``("healthy", None)`` (it passes an integrity check, e.g. another
-        worker already replaced it) or ``("unknown", None)`` (it could not be
-        checked: locked, I/O error, ...).
+        worker already replaced it), ``("unknown", None)`` (it could not be
+        checked: locked, I/O error, ...), ``("copies_over_budget", None)``
+        (damaged, but together with the copies already kept it would exceed
+        ``quarantine_max_bytes``) or ``("low_disk_space", None)`` (damaged,
+        but the volume is below ``min_free_bytes``, or its free space cannot
+        be read).
 
         Nothing is deleted. The ``-wal`` file can hold committed rows that are
         not in the main file yet, so it travels with it under the same new
@@ -393,6 +413,17 @@ class EtaObservationStore:
                 verdict = self._verify()
                 if verdict != "corrupt":
                     return verdict, None
+                # Renaming costs no space, but the copy then stays for good
+                # while a new database grows in its place. Decided under the
+                # exclusive lock, so two workers cannot both find room for
+                # "one more".
+                moving = self.disk_bytes()
+                if self.quarantine_bytes() + moving > self.config.quarantine_max_bytes:
+                    return "copies_over_budget", None
+                if self.config.min_free_bytes > 0:
+                    free = self.free_bytes()
+                    if free is None or free < self.config.min_free_bytes:
+                        return "low_disk_space", None
                 stamp = int(self._clock())
                 target = path.with_name(f"{path.name}.corrupt-{stamp}")
                 attempt = 0
@@ -649,6 +680,8 @@ class EtaObservationCollector:
             "corruption_suspected": 0,
             "corruption_recoveries": 0,
             "quarantine_deferred": 0,
+            # Why a database reported as damaged was left where it is.
+            "quarantine_blocked": None,
             "last_error": None,
             "last_error_at": None,
             "last_write_at": None,
@@ -714,8 +747,17 @@ class EtaObservationCollector:
     def status(self) -> dict[str, Any]:
         with self._lock:
             snapshot = dict(self._stats)
+        try:
+            copies, held = self._store.quarantined_copies(), self._store.quarantine_bytes()
+        except OSError:
+            copies = held = None
         snapshot.update(
             enabled=True,
+            # Every counter here belongs to the collector of this one process.
+            # Behind several workers a request reaches one of them; nothing
+            # in this answer is a total across workers.
+            worker_pid=os.getpid(),
+            counters_scope="single_worker",
             queued=self._queue.qsize(),
             queue_capacity=self._queue.maxsize,
             cities=sorted(self.config.cities),
@@ -723,6 +765,9 @@ class EtaObservationCollector:
             retention_days=round(self.config.retention_seconds / 86400, 2),
             max_bytes=self.config.max_bytes,
             min_free_bytes=self.config.min_free_bytes,
+            quarantine_max_bytes=self.config.quarantine_max_bytes,
+            quarantined_copies=copies,
+            quarantine_bytes=held,
             space_reclaim=self._store.auto_vacuum,
         )
         return snapshot
@@ -834,11 +879,11 @@ class EtaObservationCollector:
     def _recover_from_corruption(self) -> None:
         # One rebuild an hour and a few copies at most: a disk that keeps
         # corrupting the file should stop the collector, not fill the folder.
-        if (
-            time.monotonic() - self._last_quarantine < 3600
-            or self._store.quarantined_copies() >= _MAX_QUARANTINED_COPIES
-        ):
-            self._pause("corrupt")
+        if time.monotonic() - self._last_quarantine < 3600:
+            self._pause_corrupt("too_soon")
+            return
+        if self._store.quarantined_copies() >= _MAX_QUARANTINED_COPIES:
+            self._pause_corrupt("too_many_copies")
             return
         try:
             outcome, moved = self._store.quarantine()
@@ -852,9 +897,21 @@ class EtaObservationCollector:
             LOGGER.error("eta observation db failed its integrity check; kept as %s and starting fresh", moved)
         elif outcome == "healthy":
             LOGGER.warning("eta observation db reported corruption but passes its integrity check; left in place")
+        elif outcome in ("copies_over_budget", "low_disk_space"):
+            # Confirmed damaged, but one more kept copy does not fit. Losing
+            # observations is cheaper than filling the volume.
+            self._pause_corrupt(outcome)
         else:
             self._bump("quarantine_deferred")
             LOGGER.warning("eta observation db may be corrupt; left in place for now reason=%s", outcome)
+
+    def _pause_corrupt(self, blocked: str) -> None:
+        if self._stats["quarantine_blocked"] != blocked:
+            LOGGER.error(
+                "eta observation db reported corruption and was left in place reason=%s; needs an operator", blocked,
+            )
+        self._set(quarantine_blocked=blocked)
+        self._pause("corrupt")
 
     def _pause(self, reason: str) -> None:
         if self._stats["paused_reason"] != reason:
@@ -920,5 +977,6 @@ def build_collector(settings: Any) -> EtaObservationCollector | None:
             retention_seconds=max(1, int(settings.eta_observations_retention_days * 86400)),
             max_bytes=max(1, int(settings.eta_observations_max_bytes)),
             min_free_bytes=max(0, int(settings.eta_observations_min_free_bytes)),
+            quarantine_max_bytes=max(0, int(settings.eta_observations_quarantine_max_bytes)),
         )
     )

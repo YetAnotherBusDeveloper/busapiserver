@@ -343,20 +343,29 @@ TDX 可能整個縣市都回 `200 []`，但不會出錯（2026-10 高雄就這�
 | `ETA_OBSERVATIONS_RETENTION_DAYS` | 原始資料保留天數 | `30` |
 | `ETA_OBSERVATIONS_MAX_BYTES` | 資料庫加上 `-wal`／`-shm` 的大小上限；超過時先刪最舊的資料 | `1073741824` |
 | `ETA_OBSERVATIONS_MIN_FREE_BYTES` | 磁碟剩餘空間低於此值時暫停收集 | `2147483648` |
+| `ETA_OBSERVATIONS_QUARANTINE_MAX_BYTES` | 所有隔離副本（含 `-wal`／`-shm`）合計的大小上限；放不下時不隔離，改為暫停收集。`0` 表示永不自動隔離 | `1073741824` |
 
 開啟後，即時到站每次向 TDX 取得新資料時，會把該路線的原始預估（觀測時間、上游更新時間、路線、方向、站牌、車牌、秒數、狀態碼）交給背景執行緒寫入獨立資料庫。不會多打任何 TDX 請求，也不保存帳號、裝置或 IP。寫入失敗、佇列滿或磁碟不足只會少存資料，不影響 API 回應。關閉時不建立檔案、不啟動執行緒。
 
 `GET /api/v1/admin/eta-observations`（admin）回報收集狀態：寫入與重複筆數、佇列丟棄數、寫入失敗數、最後錯誤、暫停原因、檔案大小與剩餘空間。
+
+回應中的 `worker_pid` 是回答這次請求的 worker 程序，`counters_scope` 固定為 `single_worker`：所有計數、狀態與錯誤訊息都只屬於那一個 worker，**不是**各 worker 的加總。多 worker 部署時要多查幾次，用 `worker_pid` 分辨是哪一個。`quarantined_copies`／`quarantine_bytes` 是查詢當下目錄內隔離副本的份數與總大小，每個 worker 看到的都一樣。
 
 `eta_predictions.list_pos` 只是該站在單一快照內的排序，不是車輛識別；跨時間追蹤同一台車要用 `plate`。
 
 故障處理：
 
 - 資料庫被鎖住、磁碟或資料庫已滿、I/O 錯誤、無法開檔，一律只是少存資料並在 30 秒後重試（已滿時暫停到空間恢復），**不會**搬動或重建資料庫。
-- 只有 SQLite 回報 `CORRUPT`／`NOTADB`，而且重新開檔跑 `PRAGMA integrity_check` 仍然不通過，才會把資料庫連同 `-wal`／`-shm` 改名為 `eta_observations.db.corrupt-<時間>*` 後重新建立；不刪除任何檔案。每小時最多一次，目錄內已有 3 份隔離副本時改為暫停（`paused_reason=corrupt`），需人工處理。
+- 只有 SQLite 回報 `CORRUPT`／`NOTADB`，而且重新開檔跑 `PRAGMA integrity_check` 仍然不通過，才會把資料庫連同 `-wal`／`-shm` 改名為 `eta_observations.db.corrupt-<時間>*` 後重新建立；不刪除任何檔案。
+- 隔離副本不會自動刪除，所以隔離前有四道限制。任何一道不通過就**不隔離**：損壞的資料庫留在原地，收集暫停（`paused_reason=corrupt`），原因記在 `quarantine_blocked`：
+  - `too_soon`：每小時最多隔離一次。
+  - `too_many_copies`：目錄內已有 3 份隔離副本。
+  - `copies_over_budget`：現有副本加上這次要隔離的檔案（含 `-wal`／`-shm`），合計會超過 `ETA_OBSERVATIONS_QUARANTINE_MAX_BYTES`。
+  - `low_disk_space`：磁碟剩餘空間低於 `ETA_OBSERVATIONS_MIN_FREE_BYTES`，或讀不到剩餘空間。
+- 因 `corrupt` 暫停後不會自行恢復。請先把 `*.corrupt-*` 副本（或損壞的資料庫本身）複製到別處或刪除，再重新啟動服務。ETA 收集最多約佔用 `ETA_OBSERVATIONS_MAX_BYTES` 加 `ETA_OBSERVATIONS_QUARANTINE_MAX_BYTES`（預設合計 2 GiB），設定時請連同 `ETA_OBSERVATIONS_MIN_FREE_BYTES` 與磁碟上的其他資料一起算。
 - `eta_observations.db-guard` 是 0 位元組的鎖檔：每個 worker 開著資料庫時持有共享鎖，隔離前必須取得獨占鎖，所以不會在其他 worker 還開著資料庫時把檔案移走（`quarantine_deferred` 計數）。請勿刪除。用 `sqlite3` 等外部工具直接開啟正式資料庫不受這個鎖保護，分析請先複製檔案。
 - 正常關閉最多等 6 秒把佇列寫完，寫不完的計入 `dropped_on_shutdown`。程序被強制終止時，記憶體佇列中尚未寫入的快照（最多 256 筆）會遺失，已提交的資料不受影響；每批寫入是單一交易，不會留下寫到一半的快照。主機當機或斷電可能遺失最後幾筆交易（`synchronous=NORMAL`），資料庫本身保持一致。
-- 多個 worker 可共用同一個檔案，同一份快照只會存一次；各 worker 的計數各自獨立，狀態端點回報的是處理該請求的那個 worker。
+- 多個 worker 可共用同一個檔案，同一份快照只會存一次；各 worker 的計數各自獨立，狀態端點回報的是處理該請求的那個 worker（回應中的 `worker_pid`）。
 
 ## API 端點
 

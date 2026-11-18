@@ -214,6 +214,9 @@ class Settings:
     eta_observations_max_bytes: int = 1024**3
     # Collection pauses while the volume has less free space than this.
     eta_observations_min_free_bytes: int = 2 * 1024**3
+    # Budget for all quarantined (damaged) copies together. A copy that does
+    # not fit is not made; collection pauses instead.
+    eta_observations_quarantine_max_bytes: int = 1024**3
 
     def __post_init__(self) -> None:
         if self.app_db_path is None:
@@ -356,6 +359,9 @@ class Settings:
             eta_observations_max_bytes=int(os.getenv("ETA_OBSERVATIONS_MAX_BYTES", str(1024**3))),
             eta_observations_min_free_bytes=int(
                 os.getenv("ETA_OBSERVATIONS_MIN_FREE_BYTES", str(2 * 1024**3))
+            ),
+            eta_observations_quarantine_max_bytes=int(
+                os.getenv("ETA_OBSERVATIONS_QUARANTINE_MAX_BYTES", str(1024**3))
             ),
         )
 
