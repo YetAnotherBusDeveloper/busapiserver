@@ -17,6 +17,8 @@ from app.request_budget import budget_lock, budget_sleep, remaining_seconds, req
 from app.tdx_auth import TDXTokenManager
 
 LOGGER = get_logger("tdx_client")
+# $top used by every filtered realtime batch below.
+_SUBROUTE_BATCH_TOP = 2000
 
 
 @dataclass
@@ -24,6 +26,9 @@ class TDXJSONResponse:
     payload: Any
     status_code: int
     last_modified: str | None
+    # True when a filtered batch came back exactly at its $top cap, i.e. rows
+    # may have been cut off. Informational; callers that ignore it behave as before.
+    truncated: bool = False
 
     @property
     def not_modified(self) -> bool:
@@ -435,13 +440,16 @@ class TDXClient:
                     status_code=response.status_code,
                     last_modified=response.last_modified,
                 )
+            single = self._normalize_items(response.payload)
             return TDXJSONResponse(
-                payload=self._normalize_items(response.payload),
+                payload=single,
                 status_code=response.status_code,
                 last_modified=response.last_modified,
+                truncated=len(single) >= _SUBROUTE_BATCH_TOP,
             )
 
         items: list[dict[str, Any]] = []
+        truncated = False
         for chunk in chunks:
             response = self._request_json_with_meta(
                 path,
@@ -451,9 +459,11 @@ class TDXClient:
                     "$top": 2000,
                 },
             )
-            items.extend(self._normalize_items(response.payload))
+            chunk_items = self._normalize_items(response.payload)
+            truncated = truncated or len(chunk_items) >= _SUBROUTE_BATCH_TOP
+            items.extend(chunk_items)
 
-        return TDXJSONResponse(payload=items, status_code=200, last_modified=None)
+        return TDXJSONResponse(payload=items, status_code=200, last_modified=None, truncated=truncated)
 
     def fetch_realtime_by_frequency(
         self,

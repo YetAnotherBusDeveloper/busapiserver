@@ -17,6 +17,7 @@ from pathlib import Path
 import requests
 
 from app.config import INTERCITY_CITY_NAME, Settings, get_settings, guess_city_from_routeid, to_intercity_routeid
+from app.eta_observations import EtaObservationCollector
 from app.db import (
     get_connection,
     init_db,
@@ -1099,12 +1100,14 @@ class RealtimeService:
         route_buses_service: "RouteBusesService | None" = None,
         ntpc_opendata_client: NtpcOpenDataClient | None = None,
         empty_feed_monitor: EmptyRealtimeMonitor | None = None,
+        eta_observations: EtaObservationCollector | None = None,
     ) -> None:
         self.settings = settings
         self.client = client
         self.route_buses_service = route_buses_service
         self.ntpc_opendata_client = ntpc_opendata_client
         self.empty_feed_monitor = empty_feed_monitor or EmptyRealtimeMonitor(settings)
+        self.eta_observations = eta_observations
         self._cache: dict[str, CacheEntry] = {}
         self._cache_lock = threading.Lock()
         self._last_native_plate_states: dict[str, dict[tuple[int, str], LastNativePlateState]] = {}
@@ -1185,6 +1188,24 @@ class RealtimeService:
                 return cached
 
         return self._build_snapshot(routeid, static_route, [])
+
+    def _observe_eta(
+        self, city: str, items_by_route: dict[str, list[dict[str, Any]]], *, truncated: bool,
+    ) -> None:
+        """Hand the rows TDX just returned to the passive observation store.
+
+        Must run before the NTPC fallback adds synthetic rows: only what TDX
+        itself reported is kept. Queues and returns; never touches the disk.
+        """
+        collector = self.eta_observations
+        if collector is None:
+            return
+        try:
+            if collector.wants(city):
+                for routeid, items in items_by_route.items():
+                    collector.submit(city, routeid, items, truncated=truncated)
+        except Exception:
+            LOGGER.exception("eta observation hand-off failed city=%s", city)
 
     def _get_eta_first_snapshot(
         self, city: str, routeid: str, static_route: dict[str, Any]
@@ -1526,6 +1547,7 @@ class RealtimeService:
         self.empty_feed_monitor.record(
             city, effective_routeids, sum(len(items) for items in items_by_route.values()),
         )
+        self._observe_eta(city, items_by_route, truncated=bool(getattr(response, "truncated", False)))
 
         buses_by_route: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for item in (buses_response.payload if buses_response is not None else []) or []:
@@ -1624,6 +1646,7 @@ class RealtimeService:
         self.empty_feed_monitor.record(
             city, effective_routeids, sum(len(items) for items in items_by_route.values()),
         )
+        self._observe_eta(city, items_by_route, truncated=bool(getattr(response, "truncated", False)))
 
         if on_eta_ready is not None and items_by_route.get(requested_routeid):
             try:

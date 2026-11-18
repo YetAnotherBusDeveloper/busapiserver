@@ -24,6 +24,16 @@ def get_analytics(
     return build_analytics_report(settings.app_db_path, days=days, limit=limit)
 
 
+@router.get("/api/v1/admin/eta-observations")
+def get_eta_observation_status(request: Request) -> dict[str, object]:
+    """Health of the passive ETA observation store (counters only, no data)."""
+    _require_admin(request)
+    collector = getattr(request.app.state, "eta_observations", None)
+    if collector is None:
+        return {"enabled": False}
+    return collector.status()
+
+
 @router.get("/api/v1/analytics", include_in_schema=False)
 def legacy_get_analytics(
     request: Request,

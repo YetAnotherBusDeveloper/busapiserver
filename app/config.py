@@ -203,10 +203,25 @@ class Settings:
     city_buses_page_size: int = 1000
     city_buses_rate_limit_requests: int = 30
     realtime_request_budget_seconds: float = 10.0
+    # Passive ETA observation store (app/eta_observations.py). Off by default:
+    # when off no file is created and no thread is started. It only keeps rows
+    # the realtime service fetched anyway, so it never adds a TDX request.
+    eta_observations_enabled: bool = False
+    eta_observations_db_path: Path | None = None
+    eta_observations_cities: tuple[str, ...] = ("Taichung",)
+    eta_observations_retention_days: float = 30.0
+    # Budget for the database plus its -wal/-shm files.
+    eta_observations_max_bytes: int = 1024**3
+    # Collection pauses while the volume has less free space than this.
+    eta_observations_min_free_bytes: int = 2 * 1024**3
 
     def __post_init__(self) -> None:
         if self.app_db_path is None:
             object.__setattr__(self, "app_db_path", self.db_path.parent / "app.db")
+        if self.eta_observations_db_path is None:
+            object.__setattr__(
+                self, "eta_observations_db_path", self.app_db_path.parent / "eta_observations.db"
+            )
 
     def city_db_path(self, city: str) -> Path:
         return self.download_db_path.parent / f"{city}.db"
@@ -330,6 +345,18 @@ class Settings:
             realtime_request_budget_seconds=max(0.1, float(
                 os.getenv("REALTIME_REQUEST_BUDGET_SECONDS", "10")
             )),
+            eta_observations_enabled=_env_bool(os.getenv("ETA_OBSERVATIONS_ENABLED"), False),
+            eta_observations_db_path=(
+                Path(os.environ["ETA_OBSERVATIONS_DB_PATH"]).resolve()
+                if os.getenv("ETA_OBSERVATIONS_DB_PATH")
+                else None
+            ),
+            eta_observations_cities=_split_csv(os.getenv("ETA_OBSERVATIONS_CITIES"), ("Taichung",)),
+            eta_observations_retention_days=float(os.getenv("ETA_OBSERVATIONS_RETENTION_DAYS", "30")),
+            eta_observations_max_bytes=int(os.getenv("ETA_OBSERVATIONS_MAX_BYTES", str(1024**3))),
+            eta_observations_min_free_bytes=int(
+                os.getenv("ETA_OBSERVATIONS_MIN_FREE_BYTES", str(2 * 1024**3))
+            ),
         )
 
     def require_tdx_credentials(self) -> None:

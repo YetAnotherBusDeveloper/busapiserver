@@ -9,3 +9,7 @@ mcp-review-credentials.txt
 *.db-wal
 downloads/
 logs/
+# ETA observation store: quarantined copies and the cross-process guard file
+*.db.corrupt-*
+*.db-guard
+*.db-guard-journal

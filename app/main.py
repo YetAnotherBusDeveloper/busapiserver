@@ -29,6 +29,7 @@ from app.api.journeys import router as journeys_router
 from app.api.city_buses import router as city_buses_router
 from app.city_buses import CityBusesService
 from app.config import get_settings
+from app.eta_observations import build_collector
 from app.db import (
     export_download_db_if_stale,
     init_app_db,
@@ -214,11 +215,13 @@ async def lifespan(app: FastAPI):
     ntpc_opendata_client = NtpcOpenDataClient(request_timeout=settings.tdx_request_timeout)
     route_buses_service = RouteBusesService(settings, tdx_client)
     city_buses_service = CityBusesService(settings, tdx_client)
+    eta_observations = build_collector(settings)
     realtime_service = RealtimeService(
         settings,
         tdx_client,
         route_buses_service=route_buses_service,
         ntpc_opendata_client=ntpc_opendata_client,
+        eta_observations=eta_observations,
     )
     scheduler_stop_event = threading.Event()
     static_sync_coordinator = StaticSyncCoordinator()
@@ -245,6 +248,9 @@ async def lifespan(app: FastAPI):
     analytics_writer = AnalyticsWriter(settings.app_db_path)
     app.state.analytics_writer = analytics_writer
     analytics_writer.start()
+    app.state.eta_observations = eta_observations
+    if eta_observations is not None:
+        eta_observations.start()
 
     # Nothing in the app depends on the tunnel being up, so let it connect in the
     # background instead of holding startup open for it.
@@ -260,6 +266,8 @@ async def lifespan(app: FastAPI):
     finally:
         scheduler_stop_event.set()
         await asyncio.to_thread(analytics_writer.close)
+        if eta_observations is not None:
+            await asyncio.to_thread(eta_observations.close)
         scheduler_thread.join(timeout=5)
         ntpc_opendata_client.close()
         tdx_client.close()
